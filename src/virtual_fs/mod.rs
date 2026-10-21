@@ -2838,6 +2838,16 @@ impl VirtualFs {
                         self.inode_table.write().expect("inodes poisoned").remove(ino);
                         return Err(libc::EIO);
                     }
+                    // [NEW] IIASA ACCELERATOR PLATFORM USECASE: Persist caller uid/gid (JOB_GID)
+                    // to the physical overlay file so .hf_overlay_writes (meta.gid()) sees JOB_GID
+                    // instead of mountpod root (0) or directory setgid (fsGroup).
+                    #[cfg(unix)]
+                    if self.overlay() {
+                        use std::os::fd::AsRawFd;
+                        unsafe {
+                            libc::fchown(file.as_raw_fd(), caller_uid, caller_gid);
+                        }
+                    }
                     let file_handle = self.alloc_file_handle();
                     let inodes = self.inode_table.read().expect("inodes poisoned");
                     inodes.bump_open_handles(ino);
