@@ -232,12 +232,6 @@ impl Filesystem for FuseAdapter {
 
     /// Open a file. Returns a file handle and FOPEN flags.
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        // [NEW] IIASA ACCELERATOR PLATFORM USECASE: Intercept open for the virtual file
-        if ino.0 == u64::MAX - 1 {
-            reply.opened(FileHandle(u64::MAX - 1), FopenFlags::FOPEN_DIRECT_IO);
-            return;
-        }
-
         let accmode = flags.0 & libc::O_ACCMODE;
         let writable = accmode == libc::O_WRONLY || accmode == libc::O_RDWR;
         let truncate = (flags.0 & libc::O_TRUNC) != 0;
@@ -275,24 +269,6 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        // [NEW] IIASA ACCELERATOR PLATFORM USECASE: Intercept read for the virtual file
-        if fh.0 == u64::MAX - 1 {
-            if let Some(overlay) = self.virtual_fs.get_overlay_backing() {
-                let list = overlay.list_all_files().unwrap_or_default();
-                let bytes = list.as_bytes();
-                let start = offset as usize;
-                if start >= bytes.len() {
-                    reply.data(b"");
-                } else {
-                    let end = std::cmp::min(start + size as usize, bytes.len());
-                    reply.data(&bytes[start..end]);
-                }
-            } else {
-                reply.data(b"");
-            }
-            return;
-        }
-
         match self.runtime.block_on(self.virtual_fs.read(fh.0, offset, size)) {
             Ok((data, _eof)) => reply.data(&data),
             Err(e) => reply.error(Errno::from_i32(e)),

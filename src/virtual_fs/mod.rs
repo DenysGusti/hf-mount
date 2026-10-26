@@ -1236,30 +1236,8 @@ impl VirtualFs {
 
     // ── VFS operations ─────────────────────────────────────────────────
 
-    // IIASA ACCELERATOR PLATFORM USECASE: Expose overlay backing to fuse
-    pub fn get_overlay_backing(&self) -> Option<&Arc<OverlayBacking>> {
-        self.overlay_backing.as_ref()
-    }
-
     pub async fn lookup(&self, parent: u64, name: &str) -> VirtualFsResult<VirtualFsAttr> {
         debug!("lookup: parent={}, name={}", parent, name);
-
-        // [NEW] IIASA ACCELERATOR PLATFORM USECASE: Virtual file intercept for overlay writes
-        if parent == 1 && name == ".hf_overlay_writes" && self.overlay_backing.is_some() && std::env::var("ACCELERATOR_MOUNT").is_ok() {
-            return Ok(VirtualFsAttr {
-                ino: u64::MAX - 1,
-                size: 1024 * 1024 * 1024,
-                blocks: 2097152,
-                atime: SystemTime::now(),
-                mtime: SystemTime::now(),
-                ctime: SystemTime::now(),
-                kind: InodeKind::File,
-                perm: 0o444, // Read-only
-                nlink: 1,
-                uid: self.uid,
-                gid: self.gid,
-            });
-        }
 
         // Fast path: children already loaded → lookup directly, no allocation needed.
         // Revalidation info extracted from the lock scope so we can await outside it.
@@ -1601,23 +1579,6 @@ impl VirtualFs {
 
     pub fn getattr(&self, ino: u64) -> VirtualFsResult<VirtualFsAttr> {
         debug!("getattr: ino={}", ino);
-
-        // [NEW] IIASA ACCELERATOR PLATFORM USECASE
-        if ino == u64::MAX - 1 && self.overlay_backing.is_some() && std::env::var("ACCELERATOR_MOUNT").is_ok() {
-            return Ok(VirtualFsAttr {
-                ino: u64::MAX - 1,
-                size: 1024 * 1024 * 1024,
-                blocks: 2097152,
-                atime: SystemTime::now(),
-                mtime: SystemTime::now(),
-                ctime: SystemTime::now(),
-                kind: InodeKind::File,
-                perm: 0o444,
-                nlink: 1,
-                uid: self.uid,
-                gid: self.gid,
-            });
-        }
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
         match inodes.get(ino) {
@@ -2837,16 +2798,6 @@ impl VirtualFs {
                         error!("Failed to set local backing mode for {}: {}", full_path, e);
                         self.inode_table.write().expect("inodes poisoned").remove(ino);
                         return Err(libc::EIO);
-                    }
-                    // [NEW] IIASA ACCELERATOR PLATFORM USECASE: Persist caller uid/gid (JOB_GID)
-                    // to the physical overlay file so .hf_overlay_writes (meta.gid()) sees JOB_GID
-                    // instead of mountpod root (0) or directory setgid (fsGroup).
-                    #[cfg(unix)]
-                    if self.overlay() {
-                        use std::os::fd::AsRawFd;
-                        unsafe {
-                            libc::fchown(file.as_raw_fd(), caller_uid, caller_gid);
-                        }
                     }
                     let file_handle = self.alloc_file_handle();
                     let inodes = self.inode_table.read().expect("inodes poisoned");
