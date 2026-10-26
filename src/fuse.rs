@@ -235,7 +235,8 @@ impl Filesystem for FuseAdapter {
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         // [NEW] IIASA ACCELERATOR PLATFORM USECASE: see virtual_fs/acc_overlay.rs
         if ino.0 == OVERLAY_WRITES_INO {
-            reply.opened(FileHandle(OVERLAY_WRITES_INO), FopenFlags::FOPEN_DIRECT_IO);
+            let fh = self.virtual_fs.acc_overlay_writes_open();
+            reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
             return;
         }
 
@@ -343,6 +344,12 @@ impl Filesystem for FuseAdapter {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        // [NEW] IIASA ACCELERATOR PLATFORM USECASE: see virtual_fs/acc_overlay.rs
+        if self.virtual_fs.acc_overlay_writes_release(fh.0) {
+            reply.ok();
+            return;
+        }
+
         match self.runtime.block_on(self.virtual_fs.release(fh.0)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),

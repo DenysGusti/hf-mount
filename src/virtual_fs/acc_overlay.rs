@@ -5,8 +5,11 @@
 //
 // 1. `.hf_overlay_writes`: a read-only virtual file at the mount root listing every
 //    overlay file as `<relative path>:<gid>:<mtime>`, with the gid and mtime (Unix
-//    seconds) read from disk. The agent
-//    uses it to find the files its job wrote (gid == JOB_GID).
+//    seconds) read from disk. The agent uses it to find the files its job wrote
+//    (gid == JOB_GID). The listing is taken once per open and every read of that
+//    handle is served from the same snapshot: readers pull it in several chunks, and
+//    rebuilding it per read would shift offsets whenever a parallel job adds or
+//    removes a file, cutting, duplicating or dropping lines.
 //
 // 2. Ownership follows the writer: the mount pod runs hf-mount as root, so overlay
 //    files start as 0:0 on disk. A new file goes through FUSE `create`, but rewriting
@@ -15,6 +18,9 @@
 //    claim it. Every create, write-open and truncate re-stamps the file with the
 //    caller's uid/gid: the last writer owns the file.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
 use super::inode::{InodeKind, ROOT_INODE};
@@ -24,10 +30,21 @@ use crate::overlay::OverlayBacking;
 pub(crate) const OVERLAY_WRITES_NAME: &str = ".hf_overlay_writes";
 pub(crate) const OVERLAY_WRITES_INO: u64 = u64::MAX - 1;
 
-// The listing is generated on read, so the real size is unknown at lookup time.
+// The listing is generated on open, so the real size is unknown at lookup time.
 // Report a size large enough for any listing; the file is opened with DIRECT_IO and
 // reads past the end return no data.
 const OVERLAY_WRITES_SIZE: u64 = 1024 * 1024 * 1024;
+
+// File handles for open index snapshots. Real handles come from alloc_file_handle,
+// which counts up from 1 and never reaches this range.
+const OVERLAY_WRITES_FH_BASE: u64 = 1 << 62;
+static OVERLAY_WRITES_NEXT_FH: AtomicU64 = AtomicU64::new(OVERLAY_WRITES_FH_BASE);
+static OVERLAY_WRITES_SNAPSHOTS: LazyLock<Mutex<HashMap<u64, Arc<Vec<u8>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn is_overlay_writes_fh(fh: u64) -> bool {
+    fh >= OVERLAY_WRITES_FH_BASE
+}
 
 #[cfg(test)]
 thread_local! {
@@ -76,20 +93,53 @@ impl VirtualFs {
         (ino == OVERLAY_WRITES_INO && self.acc_overlay_enabled()).then(|| self.overlay_writes_attr())
     }
 
-    /// `read` hook: the requested slice of the listing, or None for any other handle.
+    /// `open` hook: snapshot the listing and return a handle for reading it.
     #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
-    pub(crate) fn acc_overlay_writes_read(&self, fh: u64, offset: u64, size: u32) -> Option<Vec<u8>> {
-        if fh != OVERLAY_WRITES_INO {
-            return None;
-        }
+    pub(crate) fn acc_overlay_writes_open(&self) -> u64 {
         let listing = match self.overlay_backing.as_deref() {
             Some(overlay) => list_overlay_writes(overlay),
             None => String::new(),
         };
-        let bytes = listing.as_bytes();
+        let fh = OVERLAY_WRITES_NEXT_FH.fetch_add(1, Ordering::Relaxed);
+        OVERLAY_WRITES_SNAPSHOTS
+            .lock()
+            .expect("overlay writes snapshots poisoned")
+            .insert(fh, Arc::new(listing.into_bytes()));
+        fh
+    }
+
+    /// `read` hook: the requested slice of the handle's snapshot, or None for any
+    /// handle that is not an index handle.
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub(crate) fn acc_overlay_writes_read(&self, fh: u64, offset: u64, size: u32) -> Option<Vec<u8>> {
+        if !is_overlay_writes_fh(fh) {
+            return None;
+        }
+        let snapshot = OVERLAY_WRITES_SNAPSHOTS
+            .lock()
+            .expect("overlay writes snapshots poisoned")
+            .get(&fh)
+            .cloned();
+        let Some(bytes) = snapshot else {
+            return Some(Vec::new());
+        };
         let start = (offset as usize).min(bytes.len());
         let end = start.saturating_add(size as usize).min(bytes.len());
         Some(bytes[start..end].to_vec())
+    }
+
+    /// `release` hook: drop the handle's snapshot. Returns false for any handle that
+    /// is not an index handle.
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub(crate) fn acc_overlay_writes_release(&self, fh: u64) -> bool {
+        if !is_overlay_writes_fh(fh) {
+            return false;
+        }
+        OVERLAY_WRITES_SNAPSHOTS
+            .lock()
+            .expect("overlay writes snapshots poisoned")
+            .remove(&fh);
+        true
     }
 
     /// Make `uid:gid` the owner of the overlay file behind `ino`, in the inode table
@@ -223,7 +273,9 @@ mod tests {
     }
 
     fn read_listing(t: &crate::test_mocks::OverlayTestVfs) -> String {
-        let data = t.vfs.acc_overlay_writes_read(OVERLAY_WRITES_INO, 0, u32::MAX).unwrap();
+        let fh = t.vfs.acc_overlay_writes_open();
+        let data = t.vfs.acc_overlay_writes_read(fh, 0, u32::MAX).unwrap();
+        t.vfs.acc_overlay_writes_release(fh);
         String::from_utf8(data).unwrap()
     }
 
@@ -262,20 +314,70 @@ mod tests {
         let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), root);
 
         let full = read_listing(&t).into_bytes();
-        assert_eq!(
-            t.vfs.acc_overlay_writes_read(OVERLAY_WRITES_INO, 2, 3).unwrap(),
-            full[2..5].to_vec()
-        );
-        assert!(
-            t.vfs
-                .acc_overlay_writes_read(OVERLAY_WRITES_INO, 10_000, 10)
-                .unwrap()
-                .is_empty()
-        );
+        let fh = t.vfs.acc_overlay_writes_open();
+        assert_eq!(t.vfs.acc_overlay_writes_read(fh, 2, 3).unwrap(), full[2..5].to_vec());
+        assert!(t.vfs.acc_overlay_writes_read(fh, 10_000, 10).unwrap().is_empty());
+        assert!(t.vfs.acc_overlay_writes_release(fh));
         assert!(
             t.vfs.acc_overlay_writes_read(42, 0, 10).is_none(),
             "other handles are not intercepted"
         );
+        assert!(
+            !t.vfs.acc_overlay_writes_release(42),
+            "other handles are not intercepted"
+        );
+    }
+
+    #[test]
+    fn writes_index_snapshot_is_stable_while_files_change() {
+        let root = overlay_dir("snapshot");
+        for i in 0..50 {
+            std::fs::write(root.join(format!("file{i:02}.rds")), b"x").unwrap();
+        }
+        let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), root);
+
+        // Read one handle in small chunks while a parallel job adds and removes files.
+        let fh = t.vfs.acc_overlay_writes_open();
+        let mut chunked = Vec::new();
+        let mut offset = 0u64;
+        let mut round = 0;
+        loop {
+            let chunk = t.vfs.acc_overlay_writes_read(fh, offset, 64).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            offset += chunk.len() as u64;
+            chunked.extend_from_slice(&chunk);
+            std::fs::write(t.overlay_root.join(format!("aaa_new{round}.rds")), b"x").unwrap();
+            let _ = std::fs::remove_file(t.overlay_root.join(format!("file{round:02}.rds")));
+            round += 1;
+        }
+        t.vfs.acc_overlay_writes_release(fh);
+
+        let mut lines: Vec<&str> = std::str::from_utf8(&chunked).unwrap().lines().collect();
+        lines.sort();
+        assert_eq!(lines.len(), 50, "every line exactly once: {lines:?}");
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                line.starts_with(&format!("file{i:02}.rds:")),
+                "unexpected line {line:?}"
+            );
+        }
+
+        // A new open sees the current state.
+        assert!(read_listing(&t).contains("aaa_new0.rds:"));
+    }
+
+    #[test]
+    fn released_handle_reads_nothing() {
+        let root = overlay_dir("released");
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), root);
+
+        let fh = t.vfs.acc_overlay_writes_open();
+        assert!(!t.vfs.acc_overlay_writes_read(fh, 0, 1024).unwrap().is_empty());
+        t.vfs.acc_overlay_writes_release(fh);
+        assert!(t.vfs.acc_overlay_writes_read(fh, 0, 1024).unwrap().is_empty());
     }
 
     #[test]
