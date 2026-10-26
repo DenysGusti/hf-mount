@@ -14,6 +14,7 @@ use crate::file_cache::FileCache;
 use crate::hub_api::{BatchOp, HubOps};
 use crate::overlay::OverlayBacking;
 
+pub(crate) mod acc_overlay;
 mod flush;
 pub mod inode;
 mod poll;
@@ -1239,6 +1240,11 @@ impl VirtualFs {
     pub async fn lookup(&self, parent: u64, name: &str) -> VirtualFsResult<VirtualFsAttr> {
         debug!("lookup: parent={}, name={}", parent, name);
 
+        // [NEW] IIASA ACCELERATOR PLATFORM USECASE: see acc_overlay.rs
+        if let Some(attr) = self.acc_overlay_writes_lookup(parent, name) {
+            return Ok(attr);
+        }
+
         // Fast path: children already loaded → lookup directly, no allocation needed.
         // Revalidation info extracted from the lock scope so we can await outside it.
         enum FastResult {
@@ -1579,6 +1585,11 @@ impl VirtualFs {
 
     pub fn getattr(&self, ino: u64) -> VirtualFsResult<VirtualFsAttr> {
         debug!("getattr: ino={}", ino);
+
+        // [NEW] IIASA ACCELERATOR PLATFORM USECASE: see acc_overlay.rs
+        if let Some(attr) = self.acc_overlay_writes_getattr(ino) {
+            return Ok(attr);
+        }
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
         match inodes.get(ino) {
@@ -2799,6 +2810,8 @@ impl VirtualFs {
                         self.inode_table.write().expect("inodes poisoned").remove(ino);
                         return Err(libc::EIO);
                     }
+                    // [NEW] IIASA ACCELERATOR PLATFORM USECASE: see acc_overlay.rs
+                    self.claim_overlay_owner(ino, caller_uid, caller_gid);
                     let file_handle = self.alloc_file_handle();
                     let inodes = self.inode_table.read().expect("inodes poisoned");
                     inodes.bump_open_handles(ino);

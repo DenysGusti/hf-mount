@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::daemon::DaemonGuard;
 use crate::setup::MountSetup;
+use crate::virtual_fs::acc_overlay::OVERLAY_WRITES_INO;
 use crate::virtual_fs::inode::InodeKind;
 use crate::virtual_fs::{InvalKind, VirtualFs, VirtualFsAttr};
 
@@ -232,6 +233,12 @@ impl Filesystem for FuseAdapter {
 
     /// Open a file. Returns a file handle and FOPEN flags.
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        // [NEW] IIASA ACCELERATOR PLATFORM USECASE: see virtual_fs/acc_overlay.rs
+        if ino.0 == OVERLAY_WRITES_INO {
+            reply.opened(FileHandle(OVERLAY_WRITES_INO), FopenFlags::FOPEN_DIRECT_IO);
+            return;
+        }
+
         let accmode = flags.0 & libc::O_ACCMODE;
         let writable = accmode == libc::O_WRONLY || accmode == libc::O_RDWR;
         let truncate = (flags.0 & libc::O_TRUNC) != 0;
@@ -241,6 +248,10 @@ impl Filesystem for FuseAdapter {
             .block_on(self.virtual_fs.open(ino.0, writable, truncate, Some(req.pid())))
         {
             Ok(file_handle) => {
+                // [NEW] IIASA ACCELERATOR PLATFORM USECASE: see virtual_fs/acc_overlay.rs
+                if writable {
+                    self.virtual_fs.claim_overlay_owner(ino.0, req.uid(), req.gid());
+                }
                 // Skip DIRECT_IO only for O_RDWR in simple streaming mode:
                 // streaming handles don't support read(), so DIRECT_IO would
                 // surface EBADF on any read attempt. O_WRONLY and read-only
@@ -269,6 +280,12 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
+        // [NEW] IIASA ACCELERATOR PLATFORM USECASE: see virtual_fs/acc_overlay.rs
+        if let Some(data) = self.virtual_fs.acc_overlay_writes_read(fh.0, offset, size) {
+            reply.data(&data);
+            return;
+        }
+
         match self.runtime.block_on(self.virtual_fs.read(fh.0, offset, size)) {
             Ok((data, _eof)) => reply.data(&data),
             Err(e) => reply.error(Errno::from_i32(e)),
@@ -478,7 +495,7 @@ impl Filesystem for FuseAdapter {
     /// Set file attributes (size, mode, uid, gid, timestamps).
     fn setattr(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -507,7 +524,16 @@ impl Filesystem for FuseAdapter {
             atime.map(resolve_time),
             mtime.map(resolve_time),
         )) {
-            Ok(attr) => reply.attr(&self.metadata_ttl, &vfs_attr_to_fuse(&attr)),
+            Ok(mut attr) => {
+                // [NEW] IIASA ACCELERATOR PLATFORM USECASE: see virtual_fs/acc_overlay.rs
+                if size.is_some() {
+                    self.virtual_fs.claim_overlay_owner(ino.0, req.uid(), req.gid());
+                    if let Ok(claimed) = self.virtual_fs.getattr(ino.0) {
+                        attr = claimed;
+                    }
+                }
+                reply.attr(&self.metadata_ttl, &vfs_attr_to_fuse(&attr))
+            }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
