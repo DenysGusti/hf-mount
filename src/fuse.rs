@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::daemon::DaemonGuard;
 use crate::setup::MountSetup;
-use crate::virtual_fs::acc_overlay::OVERLAY_WRITES_INO;
+use crate::virtual_fs::acc_overlay::{OVERLAY_WRITES_INO, acc_allow_idmap};
 use crate::virtual_fs::inode::InodeKind;
 use crate::virtual_fs::{InvalKind, VirtualFs, VirtualFsAttr};
 
@@ -176,7 +176,9 @@ impl Filesystem for FuseAdapter {
         // Allow idmapped mounts (Linux 6.2+). Required for pods running in
         // user namespaces (hostUsers: false) where the kernel needs to remap
         // uid/gid on the FUSE mount.
-        if config.add_capabilities(InitFlags::FUSE_ALLOW_IDMAP).is_err() {
+        // [NEW] IIASA ACCELERATOR PLATFORM USECASE: not requested on the accelerator
+        // platform, see acc_allow_idmap in virtual_fs/acc_overlay.rs.
+        if acc_allow_idmap() && config.add_capabilities(InitFlags::FUSE_ALLOW_IDMAP).is_err() {
             info!(
                 "kernel does not support FUSE_ALLOW_IDMAP; \
                  user namespace (idmapped) mounts may fail"
@@ -531,13 +533,10 @@ impl Filesystem for FuseAdapter {
             atime.map(resolve_time),
             mtime.map(resolve_time),
         )) {
-            Ok(mut attr) => {
+            Ok(attr) => {
                 // [NEW] IIASA ACCELERATOR PLATFORM USECASE: see virtual_fs/acc_overlay.rs
                 if size.is_some() {
                     self.virtual_fs.claim_overlay_owner(ino.0, req.uid(), req.gid());
-                    if let Ok(claimed) = self.virtual_fs.getattr(ino.0) {
-                        attr = claimed;
-                    }
                 }
                 reply.attr(&self.metadata_ttl, &vfs_attr_to_fuse(&attr))
             }

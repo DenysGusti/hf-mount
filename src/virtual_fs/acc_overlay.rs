@@ -11,12 +11,18 @@
 //    rebuilding it per read would shift offsets whenever a parallel job adds or
 //    removes a file, cutting, duplicating or dropping lines.
 //
-// 2. Ownership follows the writer: the mount pod runs hf-mount as root, so overlay
-//    files start as 0:0 on disk. A new file goes through FUSE `create`, but rewriting
-//    an existing file goes through `open` (or `setattr` for truncate) and would keep
-//    its previous owner, so a retry or a second job writing the same path would never
-//    claim it. Every create, write-open and truncate re-stamps the file with the
-//    caller's uid/gid: the last writer owns the file.
+// 2. Ownership follows the writer, on disk only: the mount pod runs hf-mount as root,
+//    so overlay files start as 0:0 on disk. A new file goes through FUSE `create`, but
+//    rewriting an existing file goes through `open` (or `setattr` for truncate) and
+//    would keep its previous owner, so a retry or a second job writing the same path
+//    would never claim it. Every create, write-open and truncate re-stamps the file on
+//    disk with the caller's uid/gid: the last writer owns the file. This on-disk owner
+//    is what `.hf_overlay_writes` reports. What hf-mount reports to the kernel is left
+//    exactly as upstream (the creator for new files, `--uid`/`--gid` otherwise).
+//
+// 3. No idmapped mounts: the claim in (2) needs the real uid/gid of whoever opens or
+//    truncates a file, which newer kernels stop sending once idmapped mounts are
+//    allowed. See `acc_allow_idmap` for the trade-off.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,6 +63,49 @@ fn accelerator_mount() -> bool {
         return enabled;
     }
     std::env::var("ACCELERATOR_MOUNT").is_ok()
+}
+
+/// Whether hf-mount may ask the kernel for FUSE_ALLOW_IDMAP (idmapped mounts) at mount
+/// time. Upstream always asks; on the accelerator platform (ACCELERATOR_MOUNT set) we
+/// do not.
+///
+/// What the flag is for: a pod with `hostUsers: false` runs in its own user namespace,
+/// so uid 65534 inside the pod is some other, large uid on the host. The kubelet then
+/// mounts the volume into the pod as an "idmapped mount" that translates ids in both
+/// directions, and the kernel only allows that for a FUSE filesystem that negotiated
+/// FUSE_ALLOW_IDMAP. `hostUsers` itself only has an effect on Kubernetes versions where
+/// the UserNamespacesSupport feature is enabled; elsewhere it is ignored and every pod
+/// shares the host's ids (`hostUsers: true` behaviour).
+///
+/// The cost of negotiating it: from Linux 6.12 on, once the flag is negotiated, the
+/// kernel sends the caller's real uid/gid only for requests that create something
+/// (create, mkdir, symlink, mknod). Every other request (open, setattr, rename, ...)
+/// arrives with uid/gid set to -1 (4294967295). `claim_overlay_owner` would then have
+/// no way to know which job rewrote or truncated a file, and stamping that -1 into the
+/// inode made the kernel refuse later writes (EACCES) and deletes (EOVERFLOW) of that
+/// file. Older kernels do not know the flag, so for them nothing changes either way.
+///
+/// The accelerator platform does not run job pods in user namespaces: jobs get their
+/// identity from the pod securityContext (runAsUser 65534, runAsGroup = per-job gid in
+/// 100000-999999, fsGroup 65534), and the job pod's /proc/self/uid_map is the identity
+/// map `0 0 4294967295`. A user namespace could not even represent those large gids,
+/// since a pod gets only 65536 ids.
+///
+/// Advantages of not asking for it:
+/// - every request carries the caller's real uid/gid on every kernel version, so the
+///   ownership claim on rewrite and truncate works the same everywhere;
+/// - no -1 owners, so writes, renames and deletes behave normally.
+///
+/// Disadvantages:
+/// - pods that really run in a user namespace (`hostUsers: false` on a cluster with
+///   UserNamespacesSupport enabled) cannot mount this volume while ACCELERATOR_MOUNT is
+///   set; if jobs are ever moved to user namespaces, this has to be revisited;
+/// - one more behaviour difference from upstream hf-mount.
+///
+/// Without ACCELERATOR_MOUNT hf-mount asks for the flag exactly as upstream does.
+#[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+pub(crate) fn acc_allow_idmap() -> bool {
+    !accelerator_mount()
 }
 
 impl VirtualFs {
@@ -142,11 +191,26 @@ impl VirtualFs {
         true
     }
 
-    /// Make `uid:gid` the owner of the overlay file behind `ino`, in the inode table
-    /// and on disk. Called after a successful create, write-open or truncate; never
-    /// fails the caller's operation.
+    /// Make `uid:gid` the owner of the overlay file behind `ino` on disk. Called after a
+    /// successful create, write-open or truncate; never fails the caller's operation.
+    ///
+    /// Only the file on disk in the overlay backing directory is changed; the inode table
+    /// is left alone. That is enough for everything the job owner is needed for: the
+    /// wkube job agent decides which files to upload and which leftovers to clean up from
+    /// `.hf_overlay_writes`, and that listing takes the gid from the file on disk (see
+    /// `file_gid`), never from the inode table. So a retried or restarted job that
+    /// rewrites a file left by an earlier run becomes its owner and syncs it.
+    ///
+    /// The inode table is not touched because nothing that matters reads the owner from
+    /// it, and changing what the kernel is told about an existing file would only risk
+    /// breaking permission checks. The kernel keeps seeing what upstream reports: the
+    /// creator for files created in this session, the mount's `--uid`/`--gid` otherwise.
+    /// Use `.hf_overlay_writes` to see which job owns a file.
+    ///
+    /// A uid or gid of -1 (4294967295) means the kernel did not say who the caller is
+    /// (see `acc_allow_idmap`); the claim is skipped rather than stamping an invalid id.
     pub(crate) fn claim_overlay_owner(&self, ino: u64, uid: u32, gid: u32) {
-        if !self.acc_overlay_enabled() {
+        if !self.acc_overlay_enabled() || uid == u32::MAX || gid == u32::MAX {
             return;
         }
         let Some(overlay) = self.overlay_backing.as_deref() else {
@@ -154,12 +218,10 @@ impl VirtualFs {
         };
 
         let full_path = {
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            let Some(entry) = inodes.get_mut(ino) else {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let Some(entry) = inodes.get(ino) else {
                 return;
             };
-            entry.uid = uid;
-            entry.gid = gid;
             entry.full_path.clone()
         };
 
@@ -436,9 +498,48 @@ mod tests {
                 731691,
                 "rewrite stamps the last writer"
             );
-            let inode_gid = t.vfs.inode_table.read().unwrap().get(ino).unwrap().gid;
-            assert_eq!(inode_gid, 731691, "inode reports the last writer");
+            assert!(
+                read_listing(&t).contains("out.rds:731691:"),
+                "index reports the last writer"
+            );
+            // What the kernel sees is left as upstream reports it: the creator.
+            let attr = t.vfs.getattr(ino).unwrap();
+            assert_eq!((attr.uid, attr.gid), (65534, 400524), "kernel view is unchanged");
         });
+    }
+
+    #[test]
+    fn invalid_caller_ids_are_never_stamped() {
+        if !running_as_root() {
+            eprintln!("skipping: chown to arbitrary gids needs root");
+            return;
+        }
+        let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), overlay_dir("invalid_ids"));
+
+        with_accelerator(true, || {
+            let ino = t.runtime.block_on(async {
+                let (attr, fh) = t
+                    .vfs
+                    .create(ROOT_INODE, "kept.rds", 0o644, 65534, 400524, None)
+                    .await
+                    .unwrap();
+                t.vfs.release(fh).await.unwrap();
+                attr.ino
+            });
+            // An idmap-capable kernel sends -1 for open/setattr callers.
+            t.vfs.claim_overlay_owner(ino, u32::MAX, u32::MAX);
+            t.vfs.claim_overlay_owner(ino, 65534, u32::MAX);
+
+            assert_eq!(disk_gid(&t.overlay_root, "kept.rds"), 400524, "disk owner unchanged");
+            let attr = t.vfs.getattr(ino).unwrap();
+            assert_eq!((attr.uid, attr.gid), (65534, 400524), "kernel view unchanged");
+        });
+    }
+
+    #[test]
+    fn idmap_is_only_requested_outside_accelerator_mode() {
+        with_accelerator(true, || assert!(!super::acc_allow_idmap()));
+        with_accelerator(false, || assert!(super::acc_allow_idmap()));
     }
 
     #[test]
