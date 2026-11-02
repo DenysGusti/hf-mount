@@ -23,14 +23,23 @@
 // 3. No idmapped mounts: the claim in (2) needs the real uid/gid of whoever opens or
 //    truncates a file, which newer kernels stop sending once idmapped mounts are
 //    allowed. See `acc_allow_idmap` for the trade-off.
+//
+// 4. `.hf_refresh`: a read-only virtual file at the mount root. Opening it runs one listing
+//    round right away and returns once the mount's view is current, so a job sees what
+//    its predecessor uploaded without waiting out the poll interval. The open fails with
+//    EIO if a directory could not be listed; otherwise reading gives "ok". The round is
+//    upstream's own `poll_remote_changes`, unmodified, run through `OneRoundHub`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::SystemTime;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 
-use super::inode::{InodeKind, ROOT_INODE};
+use super::inode::{InodeKind, InodeTable, ROOT_INODE};
 use super::{VirtualFs, VirtualFsAttr};
+use crate::error::Result as HubResult;
+use crate::hub_api::{BatchOp, HeadFileInfo, HubOps, SourceKind, TreeEntry};
 use crate::overlay::OverlayBacking;
 
 pub(crate) const OVERLAY_WRITES_NAME: &str = ".hf_overlay_writes";
@@ -40,6 +49,22 @@ pub(crate) const OVERLAY_WRITES_INO: u64 = u64::MAX - 1;
 // Report a size large enough for any listing; the file is opened with DIRECT_IO and
 // reads past the end return no data.
 const OVERLAY_WRITES_SIZE: u64 = 1024 * 1024 * 1024;
+
+pub(crate) const REFRESH_NAME: &str = ".hf_refresh";
+pub(crate) const REFRESH_INO: u64 = u64::MAX - 2;
+
+// Reads past the end return no data, so this only has to cover the reply.
+const REFRESH_SIZE: u64 = 4096;
+
+// Least time between two forced rounds. Any job can open the file, so a loop reading it
+// must not turn into a constant fan-out against the Hub.
+const REFRESH_MIN_GAP: Duration = Duration::from_secs(1);
+
+// Same as the --poll-listing-concurrency default.
+const REFRESH_LISTING_CONCURRENCY: usize = 4;
+
+// Gives up on a round that never reports back, so a job cannot hang on the open.
+const REFRESH_ROUND_TIMEOUT: Duration = Duration::from_secs(100);
 
 // File handles for open index snapshots. Real handles come from alloc_file_handle,
 // which counts up from 1 and never reaches this range.
@@ -55,6 +80,103 @@ fn is_overlay_writes_fh(fh: u64) -> bool {
 #[cfg(test)]
 thread_local! {
     static TEST_ACCELERATOR_MOUNT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// What the requests of one mount share.
+#[derive(Default)]
+pub(crate) struct AccRefresh {
+    /// Rounds started so far. Also the id of the latest round.
+    started: AtomicU64,
+    /// Held for the length of a round. Waiters queue here.
+    last: tokio::sync::Mutex<Option<FinishedRefresh>>,
+}
+
+struct FinishedRefresh {
+    round: u64,
+    result: Result<(), i32>,
+    at: Instant,
+}
+
+// Keyed by the mount's inode table so mod.rs needs no new field. Mounts live as long as
+// the process, so entries are never removed.
+static REFRESH_STATES: LazyLock<Mutex<HashMap<usize, Arc<AccRefresh>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn refresh_state(inodes: &Arc<RwLock<InodeTable>>) -> Arc<AccRefresh> {
+    REFRESH_STATES
+        .lock()
+        .expect("refresh states poisoned")
+        .entry(Arc::as_ptr(inodes) as usize)
+        .or_default()
+        .clone()
+}
+
+/// Makes upstream's poll loop run exactly one round.
+///
+/// The loop only lists when the revision changed, so every probe here reports a new one.
+/// A probe that comes after a listing means the round before it was applied: the loop is
+/// back at its top, so this reports that and parks it until the caller aborts the task.
+struct OneRoundHub {
+    inner: Arc<dyn HubOps>,
+    revision: AtomicU64,
+    listed: AtomicBool,
+    all_listed: AtomicBool,
+    finished: tokio::sync::Notify,
+}
+
+impl OneRoundHub {
+    fn new(inner: Arc<dyn HubOps>) -> Self {
+        Self {
+            inner,
+            revision: AtomicU64::new(0),
+            listed: AtomicBool::new(false),
+            all_listed: AtomicBool::new(true),
+            finished: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HubOps for OneRoundHub {
+    async fn list_tree(&self, prefix: &str) -> HubResult<Vec<TreeEntry>> {
+        self.listed.store(true, Ordering::SeqCst);
+        let result = self.inner.list_tree(prefix).await;
+        if result.is_err() {
+            self.all_listed.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+
+    async fn probe_revision(&self) -> HubResult<String> {
+        if self.listed.load(Ordering::SeqCst) {
+            self.finished.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(self.revision.fetch_add(1, Ordering::SeqCst).to_string())
+    }
+
+    async fn head_file(&self, path: &str) -> HubResult<Option<HeadFileInfo>> {
+        self.inner.head_file(path).await
+    }
+
+    async fn batch_operations(&self, ops: &[BatchOp]) -> HubResult<()> {
+        self.inner.batch_operations(ops).await
+    }
+
+    async fn download_file_http(&self, path: &str, dest: &Path) -> HubResult<()> {
+        self.inner.download_file_http(path, dest).await
+    }
+
+    fn default_mtime(&self) -> SystemTime {
+        self.inner.default_mtime()
+    }
+
+    fn source(&self) -> &SourceKind {
+        self.inner.source()
+    }
+
+    fn is_repo(&self) -> bool {
+        self.inner.is_repo()
+    }
 }
 
 fn accelerator_mount() -> bool {
@@ -113,13 +235,13 @@ impl VirtualFs {
         self.overlay_backing.is_some() && accelerator_mount()
     }
 
-    fn overlay_writes_attr(&self) -> VirtualFsAttr {
-        // Always the current time, so readers never treat the listing as unchanged.
+    fn virtual_file_attr(&self, ino: u64, size: u64) -> VirtualFsAttr {
+        // Always the current time, so readers never treat the content as unchanged.
         let now = SystemTime::now();
         VirtualFsAttr {
-            ino: OVERLAY_WRITES_INO,
-            size: OVERLAY_WRITES_SIZE,
-            blocks: OVERLAY_WRITES_SIZE.div_ceil(512),
+            ino,
+            size,
+            blocks: size.div_ceil(512),
             atime: now,
             mtime: now,
             ctime: now,
@@ -131,15 +253,84 @@ impl VirtualFs {
         }
     }
 
-    /// `lookup` hook: the virtual file at the mount root.
+    /// `lookup` hook: the virtual files at the mount root.
     pub(crate) fn acc_overlay_writes_lookup(&self, parent: u64, name: &str) -> Option<VirtualFsAttr> {
-        (parent == ROOT_INODE && name == OVERLAY_WRITES_NAME && self.acc_overlay_enabled())
-            .then(|| self.overlay_writes_attr())
+        if parent != ROOT_INODE {
+            return None;
+        }
+        match name {
+            OVERLAY_WRITES_NAME => self.acc_overlay_writes_getattr(OVERLAY_WRITES_INO),
+            REFRESH_NAME => self.acc_overlay_writes_getattr(REFRESH_INO),
+            _ => None,
+        }
     }
 
-    /// `getattr` hook for the virtual file's inode.
+    /// `getattr` hook for the virtual files' inodes.
     pub(crate) fn acc_overlay_writes_getattr(&self, ino: u64) -> Option<VirtualFsAttr> {
-        (ino == OVERLAY_WRITES_INO && self.acc_overlay_enabled()).then(|| self.overlay_writes_attr())
+        let size = match ino {
+            OVERLAY_WRITES_INO => OVERLAY_WRITES_SIZE,
+            REFRESH_INO => REFRESH_SIZE,
+            _ => return None,
+        };
+        self.acc_overlay_enabled().then(|| self.virtual_file_attr(ino, size))
+    }
+
+    /// `open` hook: bring the mount up to date and return a handle for reading "ok".
+    /// The handle is an index handle, so the index `read` and `release` hooks serve it.
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub(crate) async fn acc_refresh_open(&self) -> super::VirtualFsResult<u64> {
+        self.acc_refresh_round().await?;
+        Ok(store_snapshot(b"ok\n".to_vec()))
+    }
+
+    /// Wait for a round that started after this call, running one if there is none.
+    ///
+    /// A round already in progress at the time of the call does not count: it may have
+    /// listed a directory before the upload this caller is looking for. Everyone waiting
+    /// behind it shares the next round, so N concurrent callers cost at most two rounds.
+    async fn acc_refresh_round(&self) -> super::VirtualFsResult<()> {
+        let state = refresh_state(&self.inode_table);
+        let seen = state.started.load(Ordering::SeqCst);
+        let mut last = state.last.lock().await;
+        if let Some(done) = last.as_ref() {
+            if done.round > seen {
+                return done.result;
+            }
+            tokio::time::sleep(REFRESH_MIN_GAP.saturating_sub(done.at.elapsed())).await;
+        }
+
+        let round = state.started.fetch_add(1, Ordering::SeqCst) + 1;
+        let result = self.acc_run_one_round().await;
+        // The diff only clears entries under loaded directories that gained a file; a
+        // miss in a directory that was never listed would stay for the full TTL. Safe
+        // in overlay mode: unlink queues no remote delete that an entry would have to mask.
+        self.negative_cache.write().expect("neg_cache poisoned").clear();
+
+        *last = Some(FinishedRefresh {
+            round,
+            result,
+            at: Instant::now(),
+        });
+        result
+    }
+
+    async fn acc_run_one_round(&self) -> super::VirtualFsResult<()> {
+        let hub = Arc::new(OneRoundHub::new(self.hub_client.clone()));
+        let task = tokio::spawn(Self::poll_remote_changes(
+            hub.clone(),
+            self.inode_table.clone(),
+            self.negative_cache.clone(),
+            self.invalidator.clone(),
+            Duration::ZERO,
+            REFRESH_LISTING_CONCURRENCY,
+        ));
+        let finished = tokio::time::timeout(REFRESH_ROUND_TIMEOUT, hub.finished.notified()).await;
+        task.abort();
+        if finished.is_ok() && hub.all_listed.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(libc::EIO)
+        }
     }
 
     /// `open` hook: snapshot the listing and return a handle for reading it.
@@ -149,12 +340,7 @@ impl VirtualFs {
             Some(overlay) => list_overlay_writes(overlay),
             None => String::new(),
         };
-        let fh = OVERLAY_WRITES_NEXT_FH.fetch_add(1, Ordering::Relaxed);
-        OVERLAY_WRITES_SNAPSHOTS
-            .lock()
-            .expect("overlay writes snapshots poisoned")
-            .insert(fh, Arc::new(listing.into_bytes()));
-        fh
+        store_snapshot(listing.into_bytes())
     }
 
     /// `read` hook: the requested slice of the handle's snapshot, or None for any
@@ -229,6 +415,15 @@ impl VirtualFs {
             tracing::warn!("Failed to set overlay owner of {} to {}:{}: {}", full_path, uid, gid, e);
         }
     }
+}
+
+fn store_snapshot(bytes: Vec<u8>) -> u64 {
+    let fh = OVERLAY_WRITES_NEXT_FH.fetch_add(1, Ordering::Relaxed);
+    OVERLAY_WRITES_SNAPSHOTS
+        .lock()
+        .expect("overlay writes snapshots poisoned")
+        .insert(fh, Arc::new(bytes));
+    fh
 }
 
 /// Every regular file in the overlay as `<relative path>:<gid>:<mtime>`, one per line,
@@ -308,7 +503,15 @@ fn set_owner(_overlay: &OverlayBacking, _full_path: &str, _uid: u32, _gid: u32) 
 mod tests {
     use std::os::unix::fs::MetadataExt;
 
-    use super::{OVERLAY_WRITES_INO, OVERLAY_WRITES_NAME, TEST_ACCELERATOR_MOUNT};
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+    use std::time::SystemTime;
+
+    use super::{
+        HubResult, OVERLAY_WRITES_INO, OVERLAY_WRITES_NAME, OneRoundHub, REFRESH_INO, REFRESH_NAME,
+        TEST_ACCELERATOR_MOUNT,
+    };
+    use crate::hub_api::{BatchOp, HeadFileInfo, HubOps, SourceKind, TreeEntry};
     use crate::test_mocks::{MockHub, MockXet, make_overlay_test_vfs_with_root};
     use crate::virtual_fs::inode::ROOT_INODE;
 
@@ -464,6 +667,222 @@ mod tests {
             );
             assert!(t.vfs.acc_overlay_writes_getattr(OVERLAY_WRITES_INO).is_none());
         });
+    }
+
+    fn names(t: &crate::test_mocks::OverlayTestVfs, dir: u64) -> Vec<String> {
+        let entries = t.runtime.block_on(t.vfs.readdir(dir)).unwrap();
+        entries.into_iter().map(|e| e.name).collect()
+    }
+
+    fn read_refresh(t: &crate::test_mocks::OverlayTestVfs) -> Result<Vec<u8>, i32> {
+        let fh = t.runtime.block_on(t.vfs.acc_refresh_open())?;
+        let data = t.vfs.acc_overlay_writes_read(fh, 0, 4096).unwrap();
+        assert!(t.vfs.acc_overlay_writes_release(fh));
+        Ok(data)
+    }
+
+    /// A mount with `out/` listed, as a job leaves it behind.
+    fn mount_with_loaded_out(name: &str, hub: &std::sync::Arc<MockHub>) -> (crate::test_mocks::OverlayTestVfs, u64) {
+        hub.add_file("out/old.txt", 1, Some("h1"), None);
+        let t = make_overlay_test_vfs_with_root(hub.clone(), MockXet::new(), overlay_dir(name));
+        let out = t.runtime.block_on(t.vfs.lookup(ROOT_INODE, "out")).unwrap().ino;
+        names(&t, out);
+        (t, out)
+    }
+
+    #[test]
+    fn refresh_file_is_only_visible_with_accelerator_mount() {
+        let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), overlay_dir("refresh_visible"));
+
+        with_accelerator(true, || {
+            let attr = t.vfs.acc_overlay_writes_lookup(ROOT_INODE, REFRESH_NAME).unwrap();
+            assert_eq!(attr.ino, REFRESH_INO);
+            assert_eq!(attr.perm, 0o444);
+            assert!(t.vfs.acc_overlay_writes_getattr(REFRESH_INO).is_some());
+            assert!(t.vfs.acc_overlay_writes_lookup(2, REFRESH_NAME).is_none());
+        });
+        with_accelerator(false, || {
+            assert!(t.vfs.acc_overlay_writes_lookup(ROOT_INODE, REFRESH_NAME).is_none());
+            assert!(t.vfs.acc_overlay_writes_getattr(REFRESH_INO).is_none());
+        });
+    }
+
+    #[test]
+    fn refresh_shows_a_file_uploaded_after_the_directory_was_listed() {
+        let hub = MockHub::new();
+        let (t, out) = mount_with_loaded_out("refresh_listing", &hub);
+
+        hub.add_file("out/new.txt", 1, Some("h2"), None);
+        assert!(!names(&t, out).contains(&"new.txt".to_string()), "listing is stale");
+
+        assert_eq!(read_refresh(&t).unwrap(), b"ok\n");
+        assert!(names(&t, out).contains(&"new.txt".to_string()));
+    }
+
+    #[test]
+    fn refresh_shows_a_predecessors_output_on_the_same_node() {
+        let hub = MockHub::new();
+        let (t, out) = mount_with_loaded_out("refresh_same_node", &hub);
+
+        // The job writes to the overlay; the agent uploads it, then removes the overlay copy.
+        t.runtime.block_on(async {
+            let (_, fh) = t
+                .vfs
+                .create(out, "result.txt", 0o644, 65534, 400524, None)
+                .await
+                .unwrap();
+            t.vfs.release(fh).await.unwrap();
+        });
+        hub.add_file("out/result.txt", 1, Some("h3"), None);
+        t.runtime.block_on(t.vfs.unlink(out, "result.txt")).unwrap();
+        assert_eq!(
+            t.runtime.block_on(t.vfs.lookup(out, "result.txt")).map(|a| a.size),
+            Err(libc::ENOENT),
+            "hidden by the negative cache"
+        );
+
+        read_refresh(&t).unwrap();
+        assert_eq!(
+            t.runtime.block_on(t.vfs.lookup(out, "result.txt")).map(|a| a.size),
+            Ok(1)
+        );
+        assert!(names(&t, out).contains(&"result.txt".to_string()));
+    }
+
+    #[test]
+    fn refresh_clears_a_miss_in_a_directory_that_was_never_listed() {
+        let hub = MockHub::new();
+        hub.add_file("late/other.txt", 1, Some("h1"), None);
+        let t = make_overlay_test_vfs_with_root(hub.clone(), MockXet::new(), overlay_dir("refresh_unloaded"));
+        let late = t.runtime.block_on(t.vfs.lookup(ROOT_INODE, "late")).unwrap().ino;
+        assert_eq!(
+            t.runtime.block_on(t.vfs.lookup(late, "new.txt")).map(|a| a.size),
+            Err(libc::ENOENT)
+        );
+
+        hub.add_file("late/new.txt", 1, Some("h2"), None);
+        read_refresh(&t).unwrap();
+        assert_eq!(t.runtime.block_on(t.vfs.lookup(late, "new.txt")).map(|a| a.size), Ok(1));
+    }
+
+    #[test]
+    fn refresh_keeps_files_other_jobs_are_writing() {
+        let hub = MockHub::new();
+        let (t, out) = mount_with_loaded_out("refresh_overlay", &hub);
+        t.runtime.block_on(async {
+            let (_, fh) = t
+                .vfs
+                .create(out, "running.txt", 0o644, 65534, 400524, None)
+                .await
+                .unwrap();
+            t.vfs.release(fh).await.unwrap();
+        });
+
+        read_refresh(&t).unwrap();
+        assert!(names(&t, out).contains(&"running.txt".to_string()));
+    }
+
+    /// A hub whose every listing fails. The round under test touches nothing else.
+    struct NoListings;
+
+    #[async_trait::async_trait]
+    impl HubOps for NoListings {
+        async fn list_tree(&self, _prefix: &str) -> HubResult<Vec<TreeEntry>> {
+            Err(crate::error::Error::hub("boom"))
+        }
+        async fn head_file(&self, _path: &str) -> HubResult<Option<HeadFileInfo>> {
+            unimplemented!()
+        }
+        async fn batch_operations(&self, _ops: &[BatchOp]) -> HubResult<()> {
+            unimplemented!()
+        }
+        async fn download_file_http(&self, _path: &str, _dest: &Path) -> HubResult<()> {
+            unimplemented!()
+        }
+        fn default_mtime(&self) -> SystemTime {
+            unimplemented!()
+        }
+        fn source(&self) -> &SourceKind {
+            unimplemented!()
+        }
+        fn is_repo(&self) -> bool {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn a_failed_listing_is_recorded() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let hub = OneRoundHub::new(std::sync::Arc::new(NoListings));
+        rt.block_on(async {
+            assert!(hub.list_tree("out").await.is_err());
+        });
+        assert!(!hub.all_listed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn probes_report_a_new_revision_until_a_round_has_listed() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let hub = std::sync::Arc::new(OneRoundHub::new(std::sync::Arc::new(NoListings)));
+        rt.block_on(async {
+            let first = hub.probe_revision().await.unwrap();
+            let second = hub.probe_revision().await.unwrap();
+            assert_ne!(first, second, "the loop must not skip its listing");
+
+            let _ = hub.list_tree("").await;
+            let probing = hub.clone();
+            let parked = tokio::spawn(async move { probing.probe_revision().await });
+            hub.finished.notified().await;
+            parked.abort();
+        });
+    }
+
+    #[test]
+    fn refresh_lists_even_when_the_revision_never_changes() {
+        let hub = MockHub::new();
+        let (t, _out) = mount_with_loaded_out("refresh_same_rev", &hub);
+        let before = hub.list_tree_call_count();
+        read_refresh(&t).unwrap();
+        assert!(hub.list_tree_call_count() > before);
+    }
+
+    #[test]
+    fn concurrent_refreshes_share_rounds() {
+        let hub = MockHub::new();
+        let (t, _out) = mount_with_loaded_out("refresh_shared", &hub);
+        let rounds_before = hub.list_tree_call_count();
+        let dirs = t.vfs.inode_table.read().unwrap().loaded_dir_prefixes().len() as u32;
+
+        t.runtime.block_on(async {
+            let tasks: Vec<_> = (0..16)
+                .map(|_| {
+                    let vfs = t.vfs.clone();
+                    tokio::spawn(async move { vfs.acc_refresh_open().await })
+                })
+                .collect();
+            for task in tasks {
+                task.await.unwrap().unwrap();
+            }
+        });
+
+        let rounds = (hub.list_tree_call_count() - rounds_before) / dirs;
+        assert!((1..=2).contains(&rounds), "16 callers ran {rounds} rounds");
+    }
+
+    #[test]
+    fn a_refresh_never_reuses_a_round_that_started_before_it() {
+        let hub = MockHub::new();
+        let (t, _out) = mount_with_loaded_out("refresh_order", &hub);
+        let dirs = t.vfs.inode_table.read().unwrap().loaded_dir_prefixes().len() as u32;
+
+        read_refresh(&t).unwrap();
+        let after_first = hub.list_tree_call_count();
+        read_refresh(&t).unwrap();
+        assert_eq!(
+            hub.list_tree_call_count(),
+            after_first + dirs,
+            "the second call needs its own round"
+        );
     }
 
     #[test]

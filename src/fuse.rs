@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::daemon::DaemonGuard;
 use crate::setup::MountSetup;
-use crate::virtual_fs::acc_overlay::{OVERLAY_WRITES_INO, acc_allow_idmap};
+use crate::virtual_fs::acc_overlay::{OVERLAY_WRITES_INO, REFRESH_INO, acc_allow_idmap};
 use crate::virtual_fs::inode::InodeKind;
 use crate::virtual_fs::{InvalKind, VirtualFs, VirtualFsAttr};
 
@@ -239,6 +239,18 @@ impl Filesystem for FuseAdapter {
         if ino.0 == OVERLAY_WRITES_INO {
             let fh = self.virtual_fs.acc_overlay_writes_open();
             reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
+            return;
+        }
+        // A refresh waits on the remote, and every job on the node shares this mount:
+        // reply from a task so that jobs starting together cannot use up the FUSE workers.
+        if ino.0 == REFRESH_INO {
+            let virtual_fs = self.virtual_fs.clone();
+            self.runtime.spawn(async move {
+                match virtual_fs.acc_refresh_open().await {
+                    Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
+                    Err(e) => reply.error(Errno::from_i32(e)),
+                }
+            });
             return;
         }
 
