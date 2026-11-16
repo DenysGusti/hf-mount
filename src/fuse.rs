@@ -1,8 +1,7 @@
 use std::ffi::OsStr;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -12,13 +11,14 @@ use fuser::{
     OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
     Request, TimeOrNow,
 };
+use futures::FutureExt;
 use tracing::{error, info, warn};
 
 use crate::daemon::DaemonGuard;
-use crate::setup::MountSetup;
+use crate::setup::{FS_NAME, MountSetup, unmount_fuse};
 use crate::virtual_fs::acc_overlay::{OVERLAY_WRITES_INO, REFRESH_INO, acc_allow_idmap};
 use crate::virtual_fs::inode::InodeKind;
-use crate::virtual_fs::{InvalKind, VirtualFs, VirtualFsAttr};
+use crate::virtual_fs::{InvalKind, VirtualFs, VirtualFsAttr, VirtualFsResult};
 
 /// Always 0: we never recycle inode numbers, so generation is unnecessary.
 const GENERATION: Generation = Generation(0);
@@ -57,12 +57,16 @@ impl FuseAdapter {
     /// Per-open flags: DIRECT_IO bypasses the page cache; otherwise we ask
     /// the kernel to retain it across opens (safe because init() negotiates
     /// AUTO_INVAL_DATA, so the kernel invalidates on attr changes).
-    fn open_flags(&self) -> FopenFlags {
-        if self.direct_io {
+    fn open_flags(&self, writable: bool) -> FopenFlags {
+        let mut flags = if self.direct_io {
             FopenFlags::FOPEN_DIRECT_IO
         } else {
             FopenFlags::FOPEN_KEEP_CACHE
+        };
+        if !writable {
+            flags |= FopenFlags::FOPEN_NOFLUSH;
         }
+        flags
     }
 
     /// Return a `VirtualFsAttr` to the kernel while bumping the inode's
@@ -131,7 +135,7 @@ impl Filesystem for FuseAdapter {
         // Kernel default (12) is too low for network-backed I/O.
         let _ = config.set_max_background(64);
         // Readahead benefits local/cached files; remote lazy files use DIRECT_IO
-        // and rely on our userspace PrefetchState instead.
+        // and rely on our userspace RemoteReader instead.
         let _ = config.set_max_readahead(16 * 1_048_576); // 16 MiB
         let _ = config.set_max_write(16 * 1_048_576); // 16 MiB — fewer round-trips for large sequential writes
 
@@ -275,7 +279,7 @@ impl Filesystem for FuseAdapter {
                 let flags = if rdwr && !self.advanced_writes {
                     FopenFlags::empty()
                 } else {
-                    self.open_flags()
+                    self.open_flags(writable)
                 };
                 reply.opened(FileHandle(file_handle), flags);
             }
@@ -301,9 +305,22 @@ impl Filesystem for FuseAdapter {
             return;
         }
 
-        match self.runtime.block_on(self.virtual_fs.read(fh.0, offset, size)) {
+        let virtual_fs = self.virtual_fs.clone();
+        let mut read = Box::pin(async move { virtual_fs.read(fh.0, offset, size).await });
+        let send = |reply: ReplyData, result: VirtualFsResult<(bytes::Bytes, bool)>| match result {
             Ok((data, _eof)) => reply.data(&data),
             Err(e) => reply.error(Errno::from_i32(e)),
+        };
+        // Serve data already fetched inline. A read that waits for the
+        // network finishes in a task instead, so that it does not hold a
+        // worker thread: page faults of a memory-mapped file would queue
+        // behind it even when their own data is at hand.
+        let _runtime = self.runtime.enter();
+        match read.as_mut().now_or_never() {
+            Some(result) => send(reply, result),
+            None => {
+                self.runtime.spawn(async move { send(reply, read.await) });
+            }
         }
     }
 
@@ -398,7 +415,7 @@ impl Filesystem for FuseAdapter {
                 let oflags = if rdwr && !self.advanced_writes {
                     FopenFlags::empty()
                 } else {
-                    self.open_flags()
+                    self.open_flags(true)
                 };
                 self.reply_created_tracked(reply, &attr, file_handle, oflags);
             }
@@ -657,7 +674,7 @@ pub fn mount_fuse(
 
     let mut config = fuser::Config::default();
     config.mount_options = vec![
-        fuser::MountOption::FSName("hf-mount".to_string()),
+        fuser::MountOption::FSName(FS_NAME.to_string()),
         fuser::MountOption::DefaultPermissions,
     ];
     if setup.read_only {
@@ -668,7 +685,7 @@ pub fn mount_fuse(
         let volname = mount_point
             .file_name()
             .map(|n: &OsStr| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "hf-mount".to_string());
+            .unwrap_or_else(|| FS_NAME.to_string());
         if !volname.contains(',') {
             config
                 .mount_options
@@ -840,52 +857,4 @@ async fn wait_for_signal() {
         _ = sigterm.recv() => {}
         _ = sighup.recv() => {}
     }
-}
-
-/// Trigger FUSE unmount. Returns `true` on success. Uses libc as primary
-/// method (no external process dependency), then falls back to fusermount/umount.
-fn unmount_fuse(mount_point: &Path) -> bool {
-    use std::ffi::CString;
-
-    let c_path = CString::new(mount_point.to_string_lossy().as_bytes()).ok();
-
-    // Try libc unmount first.
-    if let Some(ref c_path) = c_path {
-        #[cfg(target_os = "linux")]
-        {
-            // MNT_DETACH: lazy unmount, detaches immediately.
-            if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
-                return true;
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // MNT_FORCE: force unmount even with open files.
-            if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
-                return true;
-            }
-        }
-    }
-
-    // Fallback: external command. Try fusermount3 first (FUSE3), then fusermount.
-    #[cfg(target_os = "linux")]
-    let cmd_ok = Command::new("fusermount3")
-        .args(["-u", "-z", &mount_point.to_string_lossy()])
-        .status()
-        .is_ok_and(|s| s.success())
-        || Command::new("fusermount")
-            .args(["-u", "-z", &mount_point.to_string_lossy()])
-            .status()
-            .is_ok_and(|s| s.success());
-    #[cfg(target_os = "macos")]
-    let cmd_ok = Command::new("umount")
-        .arg(mount_point)
-        .status()
-        .is_ok_and(|s| s.success());
-
-    if !cmd_ok {
-        error!("Failed to unmount {:?}", mount_point);
-        return false;
-    }
-    true
 }

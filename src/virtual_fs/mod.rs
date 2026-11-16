@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -18,11 +18,11 @@ pub(crate) mod acc_overlay;
 mod flush;
 pub mod inode;
 mod poll;
-mod prefetch;
+mod remote_reader;
 mod staging;
 use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
-use prefetch::{FetchPlan, PrefetchState};
+use remote_reader::{ReadAheadBudget, RemoteReader};
 use staging::StagingCoordinator;
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -35,8 +35,6 @@ const BLOCK_SIZE: u32 = 512;
 /// negative-cache pool. 1k is enough to absorb bursts; older entries roll
 /// over and a real lookup absorbs the cost on miss.
 const NEG_CACHE_CAPACITY: usize = 1_000;
-/// How long a negative-cache entry stays valid before being re-checked.
-const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
 /// `notify_inval_entry` is a blocking syscall that takes the parent dir's
 /// `i_rwsem` in the kernel and walks the dcache. Issuing thousands per sweep
 /// starves concurrent FUSE ops (lookup/readdir wait on the same lock) and
@@ -111,26 +109,43 @@ pub struct VfsConfig {
     pub advanced_writes: bool,
     pub uid: u32,
     pub gid: u32,
+    /// Mode reported for directories listed from the remote (no POSIX metadata upstream).
+    pub dir_mode: u16,
+    /// Mode reported for files listed from the remote.
+    pub file_mode: u16,
     pub poll_interval_secs: u64,
     /// Maximum concurrent tree-listing requests per poll round.
     /// Must be >= 1.
     pub poll_listing_concurrency: usize,
+    /// Subscribe to the Hub's bucket live-follow event stream (SSE) so remote
+    /// changes are applied as they happen, skipping the periodic probe +
+    /// fan-out while the stream is healthy. Falls back to interval polling
+    /// automatically when the Hub doesn't serve the feed (older deployments,
+    /// repo sources); with polling disabled too, remote changes are then
+    /// only seen through per-file revalidation.
+    pub live_follow: bool,
     pub metadata_ttl: Duration,
+    /// How long a lookup miss is remembered before the path is re-probed.
+    pub negative_ttl: Duration,
     pub serve_lookup_from_cache: bool,
     pub filter_os_files: bool,
     pub direct_io: bool,
     pub flush_debounce: Duration,
     pub flush_max_batch_window: Duration,
+    /// Advanced writes: periodic flush of open dirty files. Zero disables.
+    pub flush_interval: Duration,
     /// Max time the SIGTERM shutdown drain may spend flushing dirty data before
     /// abandoning it to guarantee the process exits within the pod's termination
     /// grace period. Must be < terminationGracePeriodSeconds, otherwise a slow
     /// Hub/CAS backend wedges the FUSE connection and strands the pod.
     pub flush_shutdown_timeout: Duration,
-    /// Upper bound on a single remote chunk fetch during a read. A stalled
-    /// fetch otherwise parks the FUSE worker thread that issued the `read()`
-    /// indefinitely; once all worker threads are parked the mount silently
-    /// wedges. `Duration::ZERO` disables the bound (legacy behaviour).
+    /// Longest wait of a remote fetch for its next chunk of data. A stalled
+    /// fetch is retried, then the reads that wait for it fail with EIO
+    /// instead of hanging. `Duration::ZERO` disables the bound (legacy
+    /// behaviour).
     pub read_fetch_timeout: Duration,
+    /// Read-ahead memory shared by the remote readers of all open handles.
+    pub read_ahead_bytes: u64,
     /// 0 disables the LRU evictor.
     pub inode_soft_limit: usize,
     pub lru_sweep_interval: Duration,
@@ -138,10 +153,13 @@ pub struct VfsConfig {
 
 /// Lock ordering (acquire in this order to prevent deadlocks):
 ///
-///   dir_loading_locks[ino]      (tokio::sync::Mutex, per-directory)
+///   dir_loading_locks\[ino\]      (tokio::sync::Mutex, per-directory)
 ///     → inode_table             (RwLock, read or write)
 ///
-///   staging.lock(ino)           (tokio::sync::Mutex, per-inode)
+///   staging.lock(ino)           (tokio::sync::Mutex, per-inode — also
+///                                serializes streaming writer creation,
+///                                streaming commits (flush/link/release),
+///                                and streaming-mode unlink)
 ///     → inode_table             (RwLock, read or write)
 ///         → open_files          (RwLock, read only — via has_open_handles)
 ///         → negative_cache      (RwLock, write — in poll_remote_changes)
@@ -181,6 +199,8 @@ pub struct VirtualFs {
     next_file_handle: AtomicU64,
     uid: u32,
     gid: u32,
+    dir_mode: u16,
+    file_mode: u16,
     /// Negative lookup cache: paths known to not exist (TTL-based).
     negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
     /// Per-directory loading locks: serializes concurrent ensure_children_loaded() calls
@@ -197,8 +217,18 @@ pub struct VirtualFs {
     /// Batched flush pipeline: dirty file writes + remote delete queue.
     /// Only present in advanced_writes mode.
     flush_manager: Option<flush::FlushManager>,
+    /// shutdown() is called multiple times by design (FUSE destroy, post-join
+    /// safety net, sidecar SIGTERM); the sequence runs once. In particular a
+    /// streaming drain aborted by its timeout leaves handles in open_files —
+    /// a second drain would wait another full timeout, doubling the
+    /// advertised shutdown deadline.
+    shutdown_once: std::sync::Once,
     /// Background poll task handle, aborted in shutdown().
     poll_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// True while polling or the live-follow feed keeps directory listings in
+    /// sync. When false, a listing is only trusted for `metadata_ttl`: nothing
+    /// else would ever show a remotely added or removed entry.
+    remote_sync: Arc<AtomicBool>,
     /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
     /// The poll loop calls this to actively invalidate stale inodes when remote changes
     /// are detected, allowing the kernel page cache to be used instead of DIRECT_IO.
@@ -222,14 +252,20 @@ pub struct VirtualFs {
     /// How long a file's metadata is trusted before re-checking via HEAD.
     /// Matches the kernel metadata TTL so HEAD is called at most once per TTL window.
     metadata_ttl: Duration,
+    /// How long a negative-lookup entry stays valid. Caps HEAD traffic for
+    /// repeatedly-probed missing paths; also the longest a remotely-added
+    /// file stays hidden from a client that probed it before it existed.
+    negative_ttl: Duration,
     /// When false (minimal mode), every lookup triggers a HEAD request regardless
     /// of `last_revalidated`.
     /// When true, lookups within the metadata TTL window skip HEAD.
     serve_lookup_from_cache: bool,
     /// When true, reject creation of OS junk files (.DS_Store, Thumbs.db, etc.).
     filter_os_files: bool,
-    /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
+    /// When true, remote readers drop blocks once read (forward-only, no re-read cache).
     direct_io: bool,
+    /// Read-ahead memory shared by the remote readers of all open handles.
+    read_ahead_budget: Arc<ReadAheadBudget>,
     /// Optional whole-file cache. When `Some`, opens hit the local copy if the
     /// xet hash is already populated; misses kick a background populate so the
     /// next open is fast. Mutually exclusive with xet-core's chunk cache.
@@ -272,6 +308,7 @@ impl VirtualFs {
                 &runtime,
                 config.flush_debounce,
                 config.flush_max_batch_window,
+                config.flush_interval,
             ))
         } else {
             None
@@ -280,25 +317,35 @@ impl VirtualFs {
         // Create open_files before poll task so we can share with it
         let open_files: Arc<RwLock<HashMap<u64, OpenFile>>> = Arc::new(RwLock::new(HashMap::new()));
 
-        // Spawn remote change polling task (if interval > 0)
+        // Spawn the remote change task when either sync mechanism is on:
+        // interval polling (interval > 0) or the live-follow feed.
         let invalidator: Invalidator = Arc::new(OnceLock::new());
-        let poll_handle = if config.poll_interval_secs > 0 {
+        let remote_sync_on = config.poll_interval_secs > 0 || config.live_follow;
+        let remote_sync = Arc::new(AtomicBool::new(remote_sync_on));
+        let poll_handle = if remote_sync_on {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
             let bg_neg_cache = negative_cache.clone();
             let bg_invalidator = invalidator.clone();
-            let interval = Duration::from_secs(config.poll_interval_secs);
+            let interval = (config.poll_interval_secs > 0).then(|| Duration::from_secs(config.poll_interval_secs));
             // Clamp to >= 1 in case a caller (library use) constructs VfsConfig directly.
             let listing_concurrency = config.poll_listing_concurrency.max(1);
 
-            Some(runtime.spawn(Self::poll_remote_changes(
+            let poll = Self::poll_remote_changes(
                 bg_hub,
                 bg_inodes,
                 bg_neg_cache,
                 bg_invalidator,
                 interval,
                 listing_concurrency,
-            )))
+                config.live_follow,
+            );
+            let bg_remote_sync = remote_sync.clone();
+            Some(runtime.spawn(async move {
+                poll.await;
+                // Only returns when the live-follow feed is unusable and polling is disabled.
+                bg_remote_sync.store(false, Ordering::Relaxed);
+            }))
         } else {
             None
         };
@@ -307,6 +354,7 @@ impl VirtualFs {
         let vfs = Arc::new(Self {
             runtime,
             flush_shutdown_timeout: config.flush_shutdown_timeout,
+            shutdown_once: std::sync::Once::new(),
             read_fetch_timeout: config.read_fetch_timeout,
             hub_client,
             xet_sessions,
@@ -320,19 +368,24 @@ impl VirtualFs {
             next_file_handle: AtomicU64::new(1),
             uid: config.uid,
             gid: config.gid,
+            dir_mode: config.dir_mode,
+            file_mode: config.file_mode,
             negative_cache,
             dir_loading_locks: Mutex::new(HashMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
             flush_manager,
             poll_handle: Mutex::new(poll_handle),
+            remote_sync,
             invalidator,
             entry_invalidator,
             shutting_down: Arc::new(AtomicBool::new(false)),
             lru_handle: Mutex::new(None),
             metadata_ttl: config.metadata_ttl,
+            negative_ttl: config.negative_ttl,
             serve_lookup_from_cache: config.serve_lookup_from_cache,
             filter_os_files: config.filter_os_files,
             direct_io: config.direct_io,
+            read_ahead_budget: ReadAheadBudget::new(config.read_ahead_bytes),
             file_cache,
         });
 
@@ -344,6 +397,7 @@ impl VirtualFs {
                 root.atime = root.mtime;
                 root.uid = vfs.uid;
                 root.gid = vfs.gid;
+                root.mode = vfs.dir_mode;
             }
         }
 
@@ -606,23 +660,99 @@ impl VirtualFs {
 
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.
     pub fn shutdown(&self) {
-        info!("Shutting down VFS, flushing pending writes...");
-        // Stop the invalidator closures first: any further `inval_inode` writev
-        // to /dev/fuse during teardown risks an unkillable D-state wedge.
-        self.signal_shutting_down();
-        // Abort background tasks.
-        if let Some(handle) = self.poll_handle.lock().expect("poll_handle poisoned").take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.lru_handle.lock().expect("lru_handle poisoned").take() {
-            handle.abort();
-        }
-        // Flush all dirty files + queued deletes.
-        if let Some(fm) = &self.flush_manager {
-            let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
-            fm.shutdown(dirty, &self.runtime, self.flush_shutdown_timeout);
-        }
-        info!("Flush loop finished, VFS shut down.");
+        self.shutdown_once.call_once(|| {
+            info!("Shutting down VFS, flushing pending writes...");
+            // Stop the invalidator closures first: any further `inval_inode` writev
+            // to /dev/fuse during teardown risks an unkillable D-state wedge.
+            self.signal_shutting_down();
+            // Abort background tasks.
+            if let Some(handle) = self.poll_handle.lock().expect("poll_handle poisoned").take() {
+                handle.abort();
+            }
+            if let Some(handle) = self.lru_handle.lock().expect("lru_handle poisoned").take() {
+                handle.abort();
+            }
+            // Flush all dirty files + queued deletes.
+            if let Some(fm) = &self.flush_manager {
+                let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
+                fm.shutdown(dirty, &self.runtime, self.flush_shutdown_timeout);
+            } else if !self.read_only {
+                self.drain_streaming_writes();
+            }
+            info!("Flush loop finished, VFS shut down.");
+        });
+    }
+
+    /// Streaming mode has no flush manager, but an application killed by the
+    /// same SIGTERM may still have open write handles with data already
+    /// accepted by write(). Commit them (parity with the advanced-mode drain
+    /// in `shutdown`) instead of exiting and silently dropping the bytes —
+    /// the exit closes /dev/fuse, which aborts the FUSE connection under the
+    /// writer. Goes through `flush` + `release` so the normal commit-state
+    /// bookkeeping applies (already-committed handles are no-ops, failures
+    /// revert the inode), mirroring the NFS shutdown drain.
+    fn drain_streaming_writes(&self) {
+        let streaming: Vec<(u64, u64)> = {
+            let files = self.open_files.read().expect("open_files poisoned");
+            files
+                .iter()
+                .filter_map(|(fh, f)| match f {
+                    OpenFile::Streaming { ino, .. } => Some((*ino, *fh)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let deadline = self.flush_shutdown_timeout;
+        flush::run_blocking(|| {
+            self.runtime.block_on(async {
+                let drain = async {
+                    if !streaming.is_empty() {
+                        info!(
+                            "Draining {} in-flight streaming write(s) before shutdown (timeout {:?})",
+                            streaming.len(),
+                            deadline
+                        );
+                    }
+                    // Handles are independent (one worker + CAS session each):
+                    // drain them concurrently so N handles fit the same deadline
+                    // as one.
+                    futures::future::join_all(streaming.iter().map(|&(ino, fh)| async move {
+                        if let Err(errno) = self.flush(ino, fh, None).await {
+                            error!("Shutdown drain flush failed for ino={}: errno {}", ino, errno);
+                        }
+                        if let Err(errno) = self.release(fh).await {
+                            error!("Shutdown drain release failed for fh={}: errno {}", fh, errno);
+                        }
+                    }))
+                    .await;
+                    // A normal release() racing the shutdown removes its handle
+                    // from open_files before committing, so the snapshot above
+                    // misses it; its commit hook in pending_commits is how we
+                    // wait for it instead of exiting under the commit.
+                    let in_flight: Vec<u64> = self
+                        .pending_commits
+                        .lock()
+                        .expect("pending_commits poisoned")
+                        .keys()
+                        .copied()
+                        .collect();
+                    if !in_flight.is_empty() {
+                        info!(
+                            "Waiting for {} in-flight release commit(s) before shutdown",
+                            in_flight.len()
+                        );
+                    }
+                    futures::future::join_all(in_flight.iter().map(|&ino| self.await_pending_commit(ino))).await;
+                };
+                if tokio::time::timeout(deadline, drain).await.is_err() {
+                    warn!(
+                        "Streaming drain exceeded shutdown timeout ({:?}); \
+                         abandoning remaining in-flight write(s). Unflushed data is lost.",
+                        deadline
+                    );
+                }
+            });
+        });
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
@@ -778,13 +908,16 @@ impl VirtualFs {
     /// Uses a per-directory lock to prevent thundering herd: concurrent callers
     /// for the same directory wait on the lock rather than making duplicate HTTP calls.
     /// Returns ENOENT if the inode doesn't exist, ENOTDIR if it's not a directory.
-    async fn ensure_children_loaded(&self, parent_ino: u64) -> VirtualFsResult<()> {
+    /// Returns `true` when THIS call fetched and installed the listing:
+    /// `false` means it short-circuited on a listing loaded earlier (or
+    /// concurrently), which may predate a recent remote commit.
+    async fn ensure_children_loaded(&self, parent_ino: u64) -> VirtualFsResult<bool> {
         // Fast path: already loaded (no lock needed).
         {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-                Some(e) if e.children_loaded() => return Ok(()),
+                Some(e) if self.listing_is_fresh(e) => return Ok(false),
                 None => return Err(libc::ENOENT),
                 _ => {}
             }
@@ -799,7 +932,7 @@ impl VirtualFs {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-                Some(e) if e.children_loaded() => return Ok(()),
+                Some(e) if self.listing_is_fresh(e) => return Ok(false),
                 Some(e) => e.full_path.to_string(),
                 None => return Err(libc::ENOENT),
             }
@@ -809,32 +942,43 @@ impl VirtualFs {
             Ok(entries) => entries,
             Err(e) => {
                 error!("Failed to list tree for prefix '{}': {}", prefix, e);
-                return Err(libc::EIO);
+                // Preserve the error semantics: a 429 after client-side retries
+                // must surface as EAGAIN (transient), not EIO — EIO reads as
+                // hard data loss and aborts whole distributed jobs on a single
+                // rate-limited stat().
+                return Err(e.to_errno());
             }
         };
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         match inodes.get(parent_ino) {
-            Some(e) if e.children_loaded() => return Ok(()),
+            Some(e) if self.listing_is_fresh(e) => return Ok(false),
             Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
             None => return Err(libc::ENOENT),
             _ => {}
         }
         let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Entries skipped for a rename in flight: the listing stays stale, so
+        // the next lookup after the rename re-lists and sees them.
+        let mut skipped_rename = false;
 
         for entry in entries {
+            // A rename in flight committed this path: its local move inserts it.
+            if inodes.in_rename(&entry.path) {
+                skipped_rename = true;
+                continue;
+            }
             // Convert absolute bucket path to path relative to current directory.
             // e.g. prefix="models" → "models/bert/config.json" → "bert/config.json"
             let rel_path = if prefix.is_empty() {
                 entry.path.clone()
             } else {
-                entry
-                    .path
-                    .strip_prefix(&prefix)
-                    .and_then(|p| p.strip_prefix('/'))
-                    .unwrap_or(&entry.path)
-                    .to_string()
+                match crate::hub_api::strict_descendant_rel(&entry.path, &prefix) {
+                    Some(rel) => rel.to_string(),
+                    // list_tree guarantees strict descendants; skip defensively.
+                    None => continue,
+                }
             };
 
             if let Some(slash_pos) = rel_path.find('/') {
@@ -854,7 +998,7 @@ impl VirtualFs {
                         0,
                         self.hub_client.default_mtime(),
                         None,
-                        0o755,
+                        self.dir_mode,
                         self.uid,
                         self.gid,
                     );
@@ -871,7 +1015,11 @@ impl VirtualFs {
                     .as_deref()
                     .map(crate::hub_api::mtime_from_str)
                     .unwrap_or_else(|| self.hub_client.default_mtime());
-                let default_mode = if kind == InodeKind::Directory { 0o755 } else { 0o644 };
+                let default_mode = if kind == InodeKind::Directory {
+                    self.dir_mode
+                } else {
+                    self.file_mode
+                };
 
                 let ino = inodes.insert(
                     parent_ino,
@@ -896,8 +1044,9 @@ impl VirtualFs {
         }
 
         // Remove stale children: entries that existed locally but are no longer
-        // in the Hub listing. Skip dirty files (local writes take precedence) and
-        // files with open handles (in-flight reads/writes).
+        // in the Hub listing. Skip dirty files (local writes take precedence),
+        // files with open handles (in-flight reads/writes), and directories
+        // created locally (an empty directory has no Hub object to be listed).
         if let Some(parent) = inodes.get(parent_ino) {
             let stale: Vec<u64> = parent
                 .children
@@ -907,12 +1056,14 @@ impl VirtualFs {
                     if in_listing {
                         return false;
                     }
-                    inodes.get(c.ino).is_some_and(|e| !e.is_dirty())
+                    inodes
+                        .get(c.ino)
+                        .is_some_and(|e| !inodes.is_held_locally(e) && !e.created_locally)
                 })
                 .map(|c| c.ino)
                 .collect();
             for ino in stale {
-                if !inodes.has_dirty_or_open_descendants(ino) {
+                if !inodes.has_dirty_or_open_descendants(ino) && !inodes.has_locally_created_descendants(ino) {
                     inodes.remove(ino);
                 }
             }
@@ -925,10 +1076,12 @@ impl VirtualFs {
             // directory we'd otherwise keep ~50% slack forever. Trim now,
             // since regrowth on rare child mutations is cheap.
             parent.children.shrink_to_fit();
-            parent.children_loaded_at = Some(Instant::now());
+            if !skipped_rename {
+                parent.children_loaded_at = Some(Instant::now());
+            }
             parent.children_from_remote = true;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Recursively load all descendants of a directory so in-memory state
@@ -974,6 +1127,13 @@ impl VirtualFs {
     /// Check if any open file handle references the given inode.
     fn has_open_handles(&self, ino: u64) -> bool {
         self.inode_table.read().expect("inodes poisoned").has_open_handles(ino)
+    }
+
+    /// Whether the children listing of `entry` can be trusted without listing again.
+    fn listing_is_fresh(&self, entry: &InodeEntry) -> bool {
+        entry.children_loaded_at.is_some_and(|loaded_at| {
+            self.remote_sync.load(Ordering::Relaxed) || loaded_at.elapsed() < self.metadata_ttl
+        })
     }
 
     /// Get or create a per-directory lock for serializing ensure_children_loaded().
@@ -1062,28 +1222,51 @@ impl VirtualFs {
     /// Called in flush() before commit or deferral so open() can await the result.
     /// No-op if a hook is already installed (prevents replacing a receiver that
     /// an open() caller may already be awaiting).
+    /// Install the commit hook for `channel` (idempotent: an existing hook is
+    /// kept). Terminal-safe: a channel that already reached Committed/Failed
+    /// gets the hook fulfilled on the spot — nothing else would ever fulfill
+    /// it (release fast-paths terminal channels) and its pending_commits entry
+    /// would wedge every later open of the inode. Both racers may fulfill;
+    /// fulfill_commit_hook take()s the sender, so the second call is a no-op.
     fn install_commit_hook(&self, ino: u64, channel: &StreamingChannel) {
-        let mut hook = channel.commit_hook.lock().expect("commit_hook poisoned");
-        if hook.is_some() {
-            return; // already installed — don't replace
+        {
+            let mut hook = channel.commit_hook.lock().expect("commit_hook poisoned");
+            if hook.is_none() {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                *hook = Some(tx);
+                // Register the receiver only if the ino has none yet: a stale
+                // writer's deferred flush racing an O_TRUNC supersede must not
+                // replace the ACTIVE writer's receiver (fulfilled hooks remove
+                // their own entry, so an existing entry always belongs to a
+                // live hook). An unregistered hook is harmless: its fulfill
+                // sends to no waiter and the ownership check skips the map
+                // removal.
+                self.pending_commits
+                    .lock()
+                    .expect("pending_commits poisoned")
+                    .entry(ino)
+                    .or_insert(rx);
+            }
         }
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        *hook = Some(tx);
-        self.pending_commits
-            .lock()
-            .expect("pending_commits poisoned")
-            .insert(ino, rx);
+        if let Some(result) = terminal_result(channel) {
+            self.fulfill_commit_hook(ino, channel, result);
+        }
     }
 
-    /// Fulfill the pending commit hook with a result, then clean up the map.
+    /// Fulfill the pending commit hook with a result, then clean up the map —
+    /// but only the entry that belongs to THIS channel's hook. A replacement
+    /// writer (O_TRUNC supersede) may have installed its own hook under the
+    /// same ino between this channel's install and its fulfill; removing the
+    /// replacement's receiver would let later opens bypass its in-flight
+    /// commit.
     fn fulfill_commit_hook(&self, ino: u64, channel: &StreamingChannel, result: Result<(), i32>) {
         if let Some(tx) = channel.commit_hook.lock().expect("commit_hook poisoned").take() {
             let _ = tx.send(Some(result));
+            let mut pending = self.pending_commits.lock().expect("pending_commits poisoned");
+            if pending.get(&ino).is_some_and(|rx| rx.same_channel(&tx.subscribe())) {
+                pending.remove(&ino);
+            }
         }
-        self.pending_commits
-            .lock()
-            .expect("pending_commits poisoned")
-            .remove(&ino);
     }
 
     /// Wait for any in-flight streaming commit on this inode to complete.
@@ -1126,9 +1309,13 @@ impl VirtualFs {
         })?;
 
         // Bounded channel provides backpressure so a fast writer doesn't queue
-        // unbounded memory. 32 slots × ~128KB FUSE write = ~4MB max in-flight.
-        // blocking_send is safe here: FUSE threads are not tokio workers.
-        let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(32);
+        // unbounded memory. Slots are sized by the negotiated FUSE max_write
+        // (16 MiB, see fuse.rs set_max_write), NOT the typical ~128KB write:
+        // 8 slots × 16 MiB = 128 MiB ceiling per open write handle. Keep this
+        // small — under a stalled CAS the daemon's RSS is this backlog plus
+        // xet-core's in-flight xorbs. blocking_send is safe here: FUSE
+        // threads are not tokio workers.
+        let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(8);
         let error: Arc<std::sync::Mutex<Option<crate::error::Error>>> = Arc::new(std::sync::Mutex::new(None));
         self.runtime
             .spawn(streaming_worker(streaming_writer, rx, error.clone()));
@@ -1196,7 +1383,7 @@ impl VirtualFs {
     /// Check if a path is in the negative cache (and not expired).
     fn negative_cache_check(&self, path: &str) -> bool {
         let cache = self.negative_cache.read().expect("negative_cache poisoned");
-        matches!(cache.get(path), Some(inserted) if inserted.elapsed() < NEG_CACHE_TTL)
+        matches!(cache.get(path), Some(inserted) if inserted.elapsed() < self.negative_ttl)
     }
 
     /// Remove a path from the negative cache (e.g. after create/rename).
@@ -1214,7 +1401,7 @@ impl VirtualFs {
             // Evict up to 128 expired entries (bounded scan, not full retain).
             let expired: Vec<String> = cache
                 .iter()
-                .filter(|(_, ts)| ts.elapsed() >= NEG_CACHE_TTL)
+                .filter(|(_, ts)| ts.elapsed() >= self.negative_ttl)
                 .take(128)
                 .map(|(k, _)| k.clone())
                 .collect();
@@ -1272,11 +1459,11 @@ impl VirtualFs {
                 return Err(libc::ENOTDIR);
             }
 
-            // Try in-memory first regardless of `children_loaded`: an inode
+            // Try in-memory first regardless of a fresh listing: an inode
             // inserted via the HEAD point-lookup path or still present after
             // a partial eviction can be served without a full re-list.
             //
-            // For directories we still require `children_loaded` to trust the
+            // For directories we still require a fresh listing to trust the
             // cached entry: without the parent listing, we can't tell whether
             // the dir was removed or replaced remotely (files revalidate
             // individually via HEAD, dirs don't).
@@ -1290,17 +1477,17 @@ impl VirtualFs {
                     current_etag: entry.etag.clone(),
                 },
                 // Either a dirty file (local writes win until flushed) or any
-                // entry under a fully-listed parent we can trust as-is.
-                Some(entry) if entry.kind == InodeKind::File || parent_entry.children_loaded() => {
+                // entry under a freshly listed parent we can trust as-is.
+                Some(entry) if entry.kind == InodeKind::File || self.listing_is_fresh(parent_entry) => {
                     FastResult::Hit(self.make_vfs_attr(entry))
                 }
-                // Cached non-file under an unloaded parent: we can't HEAD-probe
-                // a directory to check it still exists (resolve endpoint only
-                // serves files), so defer to the slow path which lists.
+                // Cached non-file under an unloaded or stale parent: we can't
+                // HEAD-probe a directory to check it still exists (resolve
+                // endpoint only serves files), so defer to the slow path which lists.
                 Some(_) => FastResult::NotLoaded,
                 // No cached entry but the parent listing is authoritative →
                 // the name really doesn't exist; populate the negative cache.
-                None if parent_entry.children_loaded() => {
+                None if self.listing_is_fresh(parent_entry) => {
                     let parent_path = &parent_entry.full_path;
                     let full_path = if parent_path.is_empty() {
                         name.to_string()
@@ -1351,10 +1538,9 @@ impl VirtualFs {
                 // is authoritative. Hot path for tarball extract / xfstests
                 // creating thousands of unique names under fresh dirs.
                 //
-                // Do NOT seed the global negative cache here — its TTL is
-                // longer than metadata_ttl, and remote churn could materialize
-                // these names while the entry hides them. The listing itself
-                // is the cache for these misses.
+                // Do NOT seed the global negative cache here — remote churn
+                // could materialize these names while the entry hides them.
+                // The listing itself is the cache for these misses.
                 if local_only {
                     return Err(libc::ENOENT);
                 }
@@ -1369,18 +1555,32 @@ impl VirtualFs {
                         .map(|e| self.make_vfs_attr(e))
                         .ok_or(libc::ENOENT);
                 }
-                // HEAD probe catches files added remotely.
-                if let Ok(Some(head)) = self.hub_client.head_file(&full_path).await
-                    && head.size.is_some()
-                {
-                    return self.insert_file_from_head(parent, name, &full_path, head);
+                match self.head_probe(&full_path).await {
+                    HeadProbe::File(head) => return self.insert_file_from_head(parent, name, &full_path, head),
+                    HeadProbe::Transient(e) => return Err(e.to_errno()),
+                    HeadProbe::Inconclusive => {}
                 }
                 // The resolve endpoint returns 404 for directories, so a HEAD
                 // miss could still be a remotely-added dir. Targeted listing
-                // catches that; non-empty result means the dir exists.
-                if let Ok(entries) = self.hub_client.list_tree(&full_path).await
-                    && !entries.is_empty()
-                {
+                // catches that; list_tree only returns strict descendants of
+                // the path, so a non-empty result means the dir exists.
+                let entries = match self.hub_client.list_tree(&full_path).await {
+                    Ok(entries) => entries,
+                    Err(e) if e.is_transient() => {
+                        debug!("list miss-probe {} failed: {}", full_path, e);
+                        return Err(e.to_errno());
+                    }
+                    // The repo tree endpoint returns 404 for a nonexistent
+                    // path (buckets return an empty listing): an authoritative
+                    // miss. Other permanent failures also fall through to the
+                    // negative cache — pre-existing behavior, and unlike
+                    // transient ones they won't clear within NEG_CACHE_TTL.
+                    Err(e) => {
+                        debug!("list miss-probe {} failed permanently: {}", full_path, e);
+                        Vec::new()
+                    }
+                };
+                if !entries.is_empty() {
                     return self.insert_dir(parent, name, &full_path);
                 }
                 self.negative_cache_insert(full_path);
@@ -1417,28 +1617,59 @@ impl VirtualFs {
         // Resolve the single requested path via HEAD instead of listing the
         // whole parent — for point-access workloads (no `readdir`) this keeps
         // the inode table scoped to what the caller actually touches.
-        match self.hub_client.head_file(&full_path).await {
-            // Without size, `open_readonly` would take the empty-file shortcut
-            // and expose a zero-byte file. Fall back to list_tree which has
-            // the authoritative size from the tree index.
-            Ok(Some(head)) if head.size.is_some() => {
-                return self.insert_file_from_head(parent, name, &full_path, head);
-            }
-            // 404 may mean "doesn't exist" or "it's a directory" (the resolve
-            // endpoint only handles files), so the listing has the final word.
-            Ok(_) => {}
-            Err(e) => debug!("HEAD lookup {} failed, falling back to list: {}", full_path, e),
-        }
+        let head_probe = match self.head_probe(&full_path).await {
+            HeadProbe::File(head) => return self.insert_file_from_head(parent, name, &full_path, head),
+            other => other,
+        };
 
-        self.ensure_children_loaded(parent).await?;
+        let freshly_listed = self.ensure_children_loaded(parent).await?;
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
         match inodes.lookup_child(parent, name) {
             Some(entry) => Ok(self.make_vfs_attr(entry)),
             None => {
                 drop(inodes);
-                self.negative_cache_insert(full_path);
-                Err(libc::ENOENT)
+                // A fresh listing is authoritative regardless of the HEAD
+                // outcome: the miss is real and safe to cache.
+                if freshly_listed {
+                    self.negative_cache_insert(full_path);
+                    return Err(libc::ENOENT);
+                }
+                // The listing was loaded earlier (or by a concurrent task)
+                // and may predate a remote commit: an inconclusive probe is
+                // not authoritative enough to negative-cache (uncached ENOENT
+                // lets the next lookup retry against a fresher listing), and
+                // a rate-limited probe surfaces its errno instead of a false
+                // ENOENT.
+                match head_probe {
+                    HeadProbe::Transient(e) => Err(e.to_errno()),
+                    _ => Err(libc::ENOENT),
+                }
+            }
+        }
+    }
+
+    /// HEAD-probe `full_path` for a remotely-added file; both lookup miss
+    /// paths start here. A sized hit resolves the file directly. A 404 (also
+    /// what the file-only resolve endpoint returns for directories), a
+    /// sizeless hit (only the tree listing has the authoritative size — with
+    /// 0, `open_readonly` would take the empty-file shortcut), or a permanent
+    /// failure are inconclusive: the caller defers to a listing. A transient
+    /// failure (429 rate limit, 5xx, network) is handed back so the caller
+    /// returns its errno — swallowing it into ENOENT would cache a false
+    /// negative that hides a freshly committed path (e.g. a `_READY` marker)
+    /// for NEG_CACHE_TTL even after the Hub recovers.
+    async fn head_probe(&self, full_path: &str) -> HeadProbe {
+        match self.hub_client.head_file(full_path).await {
+            Ok(Some(head)) if head.size.is_some() => HeadProbe::File(head),
+            Ok(_) => HeadProbe::Inconclusive,
+            Err(e) if e.is_transient() => HeadProbe::Transient(e),
+            Err(e) => {
+                debug!(
+                    "HEAD probe {} failed permanently, deferring to listing: {}",
+                    full_path, e
+                );
+                HeadProbe::Inconclusive
             }
         }
     }
@@ -1492,7 +1723,7 @@ impl VirtualFs {
             size,
             mtime,
             head.xet_hash,
-            0o644,
+            self.file_mode,
             self.uid,
             self.gid,
         );
@@ -1529,7 +1760,7 @@ impl VirtualFs {
             0,
             self.hub_client.default_mtime(),
             None,
-            0o755,
+            self.dir_mode,
             self.uid,
             self.gid,
         );
@@ -1849,20 +2080,44 @@ impl VirtualFs {
         let staging_mutex = self.staging.lock(ino);
         let _staging_guard = staging_mutex.lock().await;
 
-        // Capture inode snapshot before mutation (for revert on commit failure)
-        let snapshot = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-            InodeSnapshot {
-                xet_hash: entry.xet_hash.clone(),
-                size: entry.size,
-                mtime: entry.mtime,
-                pending_deletes: entry.pending_deletes.clone(),
-                existed_before: true,
+        // Capture inode snapshot before mutation (for revert on commit failure).
+        // When superseding an active writer, inherit ITS snapshot: the inode
+        // is already dirty (xet_hash stripped by the old writer's open), so
+        // snapshotting it now would make a later failed commit revert to a
+        // hashless ghost state instead of the last committed one. The
+        // per-inode lock held across this whole function keeps the active
+        // channel stable between this lookup and the supersede below.
+        let active = self.streaming_channel_for(ino);
+        let snapshot = match &active {
+            Some(active) => active.snapshot.clone(),
+            None => {
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+                InodeSnapshot {
+                    xet_hash: entry.xet_hash.clone(),
+                    size: entry.size,
+                    mtime: entry.mtime,
+                    pending_deletes: entry.pending_deletes.clone(),
+                    existed_before: true,
+                }
             }
         };
 
         let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0).await?;
+
+        // The replacement writer is ready — supersede the active writer
+        // (only after setup succeeded: failing the old writer for a stillborn
+        // replacement would strand its acknowledged bytes for nothing). The
+        // generation bump below makes the old channel's bytes uncommittable
+        // (streaming_commit skips superseded channels), so fail it loudly
+        // NOW: its writes and flush must return EIO instead of acknowledging
+        // bytes that would be silently discarded. Fulfilling the hook
+        // unblocks any open() already waiting on the old channel's deferred
+        // commit.
+        if let Some(old) = active {
+            *old.state.lock().expect("state poisoned") = CommitState::Failed("superseded by O_TRUNC reopen".into());
+            self.fulfill_commit_hook(ino, &old, Err(libc::EIO));
+        }
 
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
@@ -1997,176 +2252,23 @@ impl VirtualFs {
         }
     }
 
-    /// Allocate a lazy file handle backed by a prefetch buffer.
+    /// Allocate a lazy file handle that fetches remote data on demand.
     fn open_lazy(&self, ino: u64, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
-        let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(
+        let reader = RemoteReader::new(
             xet_hash,
             size,
+            self.xet_sessions.clone(),
+            self.read_fetch_timeout,
             self.direct_io,
-        )));
+            self.read_ahead_budget.clone(),
+        );
         let file_handle = self.alloc_file_handle();
         self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
         self.open_files
             .write()
             .expect("open_files poisoned")
-            .insert(file_handle, OpenFile::Lazy { ino, prefetch });
+            .insert(file_handle, OpenFile::Lazy { ino, reader });
         Ok(file_handle)
-    }
-
-    /// Fetch data for the prefetch buffer. Uses the persistent stream for sequential
-    /// reads (with automatic (re)start), or opens a temporary stream with retries
-    /// for range/seek access. Returns EIO if all attempts fail.
-    async fn fetch_data(
-        &self,
-        prefetch_state: &mut PrefetchState,
-        cursor: u64,
-        plan: &FetchPlan,
-        file_size: u64,
-    ) -> std::result::Result<(VecDeque<Bytes>, usize), i32> {
-        const MAX_ATTEMPTS: u32 = 3;
-        let file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
-
-        // Take the persistent stream before the loop (sequential reads).
-        // first_stream.take() only returns Some on the first iteration.
-        let mut first_stream = if plan.strategy.is_stream() {
-            prefetch_state.stream.take()
-        } else {
-            None
-        };
-
-        for attempt in 0..MAX_ATTEMPTS {
-            let stream = match first_stream.take() {
-                Some(s) => Some(s),
-                None => match self.xet_sessions.download_stream_boxed(
-                    &file_info,
-                    cursor,
-                    // For range downloads (random reads / seeks), bound the request
-                    // so CAS only returns terms covering the needed bytes.
-                    // For streaming, leave unbounded so the stream can continue.
-                    if plan.strategy == prefetch::FetchStrategy::RangeDownload {
-                        Some(cursor + plan.fetch_size)
-                    } else {
-                        None
-                    },
-                ) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        warn!(
-                            "prefetch: stream open failed: cursor={}, attempt={}/{}: {}",
-                            cursor,
-                            attempt + 1,
-                            MAX_ATTEMPTS,
-                            e,
-                        );
-                        None
-                    }
-                },
-            };
-
-            if let Some(mut stream) = stream {
-                // Read chunks until fetch_size bytes
-                let mut chunks = VecDeque::new();
-                let mut total = 0usize;
-                let mut failed = false;
-                let mut stream_eof = false;
-                while (total as u64) < plan.fetch_size {
-                    // Bound each chunk read. A FUSE `read()` runs on a worker
-                    // thread blocked in `block_on` on this future; if the
-                    // CAS/CDN connection stalls (client-aborted seek, hung
-                    // socket), an unbounded `next()` parks that thread forever.
-                    // Enough stalled reads exhaust all worker threads and the
-                    // mount silently stops serving cold reads. The timeout frees
-                    // the thread, and dropping `stream` on the way out cancels
-                    // the in-flight request.
-                    let next = match self.read_fetch_timeout {
-                        Duration::ZERO => stream.next().await,
-                        timeout => match tokio::time::timeout(timeout, stream.next()).await {
-                            Ok(result) => result,
-                            Err(_elapsed) => {
-                                error!(
-                                    "prefetch: stream read timed out after {:?} at cursor={}, got={}/{}, \
-                                     attempt={}/{}, hash={} — aborting fetch to free the FUSE worker thread",
-                                    timeout,
-                                    cursor,
-                                    total,
-                                    plan.fetch_size,
-                                    attempt + 1,
-                                    MAX_ATTEMPTS,
-                                    prefetch_state.xet_hash,
-                                );
-                                failed = true;
-                                break;
-                            }
-                        },
-                    };
-                    match next {
-                        Ok(Some(chunk)) => {
-                            total += chunk.len();
-                            chunks.push_back(chunk);
-                        }
-                        Ok(None) => {
-                            stream_eof = true;
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "prefetch: stream read error at cursor={}, got={}/{}, attempt={}/{}: {}",
-                                cursor,
-                                total,
-                                plan.fetch_size,
-                                attempt + 1,
-                                MAX_ATTEMPTS,
-                                e,
-                            );
-                            failed = true;
-                            break;
-                        }
-                    }
-                }
-
-                // Early EOF sanity check: only meaningful when we got some data
-                // (zero-data EOF is just a failed attempt, handled by retry below)
-                if stream_eof && total > 0 {
-                    let stream_total = cursor + total as u64;
-                    if stream_total < file_size {
-                        error!(
-                            "prefetch: stream EOF at cursor={} after {} bytes (file_size={}, \
-                             shortfall={}, hash={})",
-                            cursor,
-                            total,
-                            file_size,
-                            file_size - stream_total,
-                            prefetch_state.xet_hash,
-                        );
-                        debug_assert!(
-                            false,
-                            "stream EOF before file_size: got {stream_total}, expected {file_size}"
-                        );
-                    }
-                } else if plan.strategy.is_stream() && !failed {
-                    // Keep stream alive for future sequential reads
-                    prefetch_state.stream = Some(stream);
-                }
-
-                if total > 0 {
-                    debug!(
-                        "prefetch fetch: cursor={}, got={}, window={}",
-                        cursor, total, prefetch_state.window_size,
-                    );
-                    return Ok((chunks, total));
-                }
-            }
-
-            if attempt + 1 < MAX_ATTEMPTS {
-                tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
-            }
-        }
-
-        error!(
-            "prefetch: all {} fetch attempts failed: cursor={}, hash={}",
-            MAX_ATTEMPTS, cursor, prefetch_state.xet_hash,
-        );
-        Err(libc::EIO)
     }
 
     /// Read data from an open file. Returns `(data, eof)`.
@@ -2179,9 +2281,7 @@ impl VirtualFs {
             let files = self.open_files.read().expect("open_files poisoned");
             match files.get(&file_handle) {
                 Some(OpenFile::Local { file, .. }) => ReadTarget::LocalFd(file.clone()),
-                Some(OpenFile::Lazy { prefetch, .. }) => ReadTarget::Remote {
-                    prefetch: prefetch.clone(),
-                },
+                Some(OpenFile::Lazy { reader, .. }) => ReadTarget::Remote(reader.clone()),
                 // write-only, not readable
                 Some(OpenFile::Streaming { .. }) => return Err(libc::EBADF), // write-only, not readable
                 None => return Err(libc::EBADF), // handle already closed (race with release)
@@ -2210,80 +2310,7 @@ impl VirtualFs {
                     Ok((buf.freeze(), eof))
                 }
             }
-            ReadTarget::Remote { prefetch } => {
-                let mut prefetch_state = prefetch.lock().await;
-
-                let file_size = prefetch_state.file_size;
-
-                // Past EOF
-                if offset >= file_size {
-                    return Ok((Bytes::new(), true));
-                }
-
-                // Maximum bytes we should return (capped at file boundary).
-                let to_read = ((size as u64).min(file_size - offset)) as usize;
-
-                // IMPORTANT: Never return a short read unless at real EOF.
-                // The Linux FUSE kernel module shrinks i_size on short reads
-                // (fuse_read_update_size), which makes subsequent reads return
-                // 0 bytes and truncates the file from the application's view.
-
-                let mut response = BytesMut::with_capacity(to_read);
-                let mut cursor = offset;
-
-                // Fast path: forward buffer has enough data (common case, zero-copy).
-                if let Some(data) = prefetch_state.try_serve_forward(offset, size) {
-                    if data.len() == to_read {
-                        debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
-                        let eof = offset + data.len() as u64 >= file_size;
-                        return Ok((data, eof));
-                    }
-                    cursor += data.len() as u64;
-                    response.extend_from_slice(&data);
-                } else if let Some(data) = prefetch_state.try_serve_seek(offset, size) {
-                    // Seek window: only reachable when forward buffer has no data
-                    // at this offset (backward seek). Zero-copy on full hit.
-                    if data.len() == to_read {
-                        debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
-                        let eof = offset + data.len() as u64 >= file_size;
-                        return Ok((data, eof));
-                    }
-                    cursor += data.len() as u64;
-                    response.extend_from_slice(&data);
-                }
-
-                // Assembly loop: fetch more data until we have to_read bytes.
-                // Only reached at prefetch window boundaries or cache misses.
-                while response.len() < to_read {
-                    let remaining = (to_read - response.len()) as u32;
-                    let plan = prefetch_state.prepare_fetch(cursor, remaining);
-                    debug!(
-                        "prefetch miss: cursor={}, remaining={}, strategy={:?}, fetch_size={}, \
-                         buf_start={}, file_size={}, has_stream={}",
-                        cursor,
-                        remaining,
-                        plan.strategy,
-                        plan.fetch_size,
-                        prefetch_state.buf_start,
-                        file_size,
-                        prefetch_state.stream.is_some(),
-                    );
-
-                    let (chunks, total) = self.fetch_data(&mut prefetch_state, cursor, &plan, file_size).await?;
-
-                    prefetch_state.store_fetched(cursor, chunks, total);
-
-                    // Drain freshly filled buffer into response
-                    let remaining = (to_read - response.len()) as u32;
-                    if let Some(data) = prefetch_state.try_serve_forward(cursor, remaining) {
-                        cursor += data.len() as u64;
-                        response.extend_from_slice(&data);
-                    }
-                }
-
-                let eof = cursor == file_size;
-                Ok((response.freeze(), eof))
-            }
+            ReadTarget::Remote(reader) => reader.read(offset, size).await,
         }
     }
 
@@ -2379,10 +2406,37 @@ impl VirtualFs {
                 }
 
                 let len = data.len();
-                channel.tx.blocking_send(WriteMsg::Data(data.to_vec())).map_err(|_| {
+                // Reserve the channel slot BEFORE taking the state mutex: the
+                // backpressure wait (32-slot channel, worker draining at
+                // network speed) must not run while holding the lock every
+                // commit path contends on. permit.send() cannot block, so the
+                // state check and the enqueue below stay atomic under the
+                // mutex streaming_commit() flips to Committing under: either
+                // this Data lands ahead of Finish (and joins the commit), or
+                // the write observes Committing/Committed and fails loudly
+                // instead of being silently dropped behind Finish.
+                let closed = || {
                     error!("streaming channel closed for ino={}", handle_ino);
                     libc::EIO
-                })?;
+                };
+                let permit = match channel.tx.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                        self.runtime.block_on(channel.tx.reserve()).map_err(|_| closed())?
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => return Err(closed()),
+                };
+                {
+                    let state = channel.state.lock().expect("state poisoned");
+                    match &*state {
+                        CommitState::Writing | CommitState::Deferred => {}
+                        _ => {
+                            debug!("streaming write after commit rejected for ino={}", handle_ino);
+                            return Err(libc::EIO);
+                        }
+                    }
+                    permit.send(WriteMsg::Data(data.to_vec()));
+                }
                 channel.bytes_written.fetch_add(len as u64, Ordering::Relaxed);
 
                 let new_size = offset + len as u64;
@@ -2423,7 +2477,7 @@ impl VirtualFs {
                         debug!("flush: already failed for ino={}: {}", ino, msg);
                         return Err(libc::EIO);
                     }
-                    CommitState::Writing | CommitState::Deferred => {}
+                    CommitState::Writing | CommitState::Deferred | CommitState::Committing => {}
                 }
             }
 
@@ -2436,37 +2490,18 @@ impl VirtualFs {
                     "flush: deferring commit for ino={} (open_pid={}, flush_pid={})",
                     ino, open_pid, flush_pid
                 );
-                self.install_commit_hook(ino, &channel);
-                *channel.state.lock().expect("state poisoned") = CommitState::Deferred;
+                self.defer_commit(ino, &channel);
                 return Ok(());
             }
 
             // Secondary gate: skip commit if no data was written (covers NFS
             // and zero-write cases like `touch`). release() will handle it.
             if channel.bytes_written.load(Ordering::Relaxed) == 0 {
-                self.install_commit_hook(ino, &channel);
-                *channel.state.lock().expect("state poisoned") = CommitState::Deferred;
+                self.defer_commit(ino, &channel);
                 return Ok(());
             }
 
-            // Install hook before commit so concurrent open() can wait on us.
-            self.install_commit_hook(ino, &channel);
-
-            match self.streaming_commit(ino, &channel).await {
-                Ok(()) => {
-                    *channel.state.lock().expect("state poisoned") = CommitState::Committed;
-                    self.fulfill_commit_hook(ino, &channel, Ok(()));
-                }
-                Err(e) => {
-                    // CAS upload may have succeeded — file_info is preserved
-                    // in pending_info for retry in release(). Don't fulfill the
-                    // hook here: release() will retry and publish the final outcome.
-                    // Keeping the hook active ensures concurrent open(O_TRUNC) waits
-                    // for release() instead of racing with the retry.
-                    return Err(e);
-                }
-            }
-            return Ok(());
+            return self.commit_streaming_now(ino, &channel).await;
         }
 
         // Advanced writes mode: check if a previous async flush failed
@@ -2482,11 +2517,20 @@ impl VirtualFs {
     pub async fn release(&self, file_handle: u64) -> VirtualFsResult<()> {
         debug!("release: fh={}", file_handle);
 
-        let removed = self
-            .open_files
-            .write()
-            .expect("open_files poisoned")
-            .remove(&file_handle);
+        // Hand the commit over under the same lock that drops the handle: the
+        // shutdown drain finds in-flight releases through pending_commits, so
+        // there must be no window where a committing handle is in neither map.
+        // (Already-committed closes, the common case, skip the install.)
+        let removed = {
+            let mut files = self.open_files.write().expect("open_files poisoned");
+            let removed = files.remove(&file_handle);
+            if let Some(OpenFile::Streaming { ino, channel }) = &removed
+                && !channel_is_terminal(channel)
+            {
+                self.install_commit_hook(*ino, channel);
+            }
+            removed
+        };
 
         let released_ino = match &removed {
             Some(OpenFile::Local { ino, .. })
@@ -2494,9 +2538,6 @@ impl VirtualFs {
             | Some(OpenFile::Streaming { ino, .. }) => Some(*ino),
             _ => None,
         };
-        if let Some(ino) = released_ino {
-            self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
-        }
 
         let mut release_error: Option<i32> = None;
 
@@ -2516,18 +2557,29 @@ impl VirtualFs {
                     fm.enqueue(ino);
                 }
             }
-            Some(OpenFile::Streaming { ino, channel }) => {
+            Some(OpenFile::Streaming { ino, channel }) if !channel_is_terminal(&channel) => {
+                // (Terminal states never regress, so the unlocked fast-path
+                // check above safely skips the per-inode lock — which another
+                // handle may hold across a whole commit — on the common
+                // already-committed close.)
+                //
+                // Serialize against an in-flight flush()/link() commit: without
+                // the lock, release() would observe `Committing`, re-run the
+                // commit against the in-flight one, and fail with a spurious
+                // EIO plus an inode revert racing the successful commit.
+                let staging_mutex = self.staging.lock(ino);
+                let _commit_guard = staging_mutex.lock().await;
                 let needs_commit = {
                     let state = channel.state.lock().expect("state poisoned");
-                    matches!(&*state, CommitState::Writing | CommitState::Deferred)
+                    // Committing under the lock: an earlier flush()/link()
+                    // commit failed mid-flight (pending_info parked) —
+                    // release retries it.
+                    matches!(
+                        &*state,
+                        CommitState::Writing | CommitState::Deferred | CommitState::Committing
+                    )
                 };
                 if needs_commit {
-                    // If flush() didn't defer (e.g. Writing state from a direct
-                    // release without flush), install the hook now.
-                    if channel.commit_hook.lock().expect("commit_hook poisoned").is_none() {
-                        self.install_commit_hook(ino, &channel);
-                    }
-
                     let result = match self.streaming_commit(ino, &channel).await {
                         Ok(()) => Ok(()),
                         Err(e) => {
@@ -2572,48 +2624,67 @@ impl VirtualFs {
             _ => {}
         }
 
-        if let Some(ino) = released_ino
-            && !self.has_open_handles(ino)
-        {
-            let (removed, is_clean, overlay_path) = {
-                let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                // Capture path before removal so we can clean up the overlay
-                // backing file for an unlink-while-open case (POSIX delete on
-                // last close): unlink() saw open handles and skipped the
-                // overlay-side remove, so we have to do it here.
-                let overlay_path = self
-                    .overlay_backing
-                    .is_some()
-                    .then(|| inodes.get(ino).map(|e| e.full_path.clone()))
-                    .flatten();
-                let orphan = inodes.remove_orphan(ino);
-                let evicted = inodes.take_evict_pending(ino) && inodes.evict_if_safe(ino);
-                let removed = orphan || evicted;
-                let is_clean = !removed && inodes.get(ino).is_some_and(|entry| !entry.is_dirty());
-                (removed, is_clean, overlay_path.filter(|_| removed))
-            };
-            if removed {
-                if let Some(path) = overlay_path {
-                    if let Err(e) = self.remove_local_backing_file(ino, &path)
-                        && e.kind() != std::io::ErrorKind::NotFound
-                    {
-                        warn!("Failed to remove overlay file for ino={} on release: {}", ino, e);
-                    }
-                } else {
-                    self.drop_staging(ino);
-                }
-            } else if is_clean && self.staging.gc_one(ino, &self.inode_table).await {
-                debug!("staging GC: removed ino={} on release", ino);
-            }
-        }
+        if let Some(ino) = released_ino {
+            // Decrement the handle count only after the commit section above:
+            // a release() parked on the per-inode lock behind an in-flight
+            // link() commit must keep the inode "open", or a concurrent
+            // unlink of the dirty file passes its open-handles guard and the
+            // source AddFile then resurrects the just-removed path on the
+            // Hub.
+            self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
 
-        // Per-inode staging locks are intentionally not cleaned up here:
-        // removing while another open() may hold the Arc would break
-        // serialization. Entries are tiny and bounded by inodes ever staged.
+            if !self.has_open_handles(ino) {
+                self.reap_on_last_release(ino).await;
+            }
+
+            // Reclaim the per-inode lock entry once nothing else holds its
+            // Arc (strong_count check inside — a held or awaited lock is
+            // never removed, so serialization is preserved). Without this,
+            // create-heavy streaming workloads grow the map by one entry per
+            // file created for the life of the mount (unlink handles the
+            // delete-heavy counterpart).
+            self.staging.forget_lock_if_unused(ino);
+        }
 
         match release_error {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+
+    /// Last-close cleanup: reap the orphan or evict-pending inode, remove its
+    /// local backing (overlay file or staging), and GC clean staging files
+    /// over budget.
+    async fn reap_on_last_release(&self, ino: u64) {
+        let (removed, is_clean, overlay_path) = {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            // Capture path before removal so we can clean up the overlay
+            // backing file for an unlink-while-open case (POSIX delete on
+            // last close): unlink() saw open handles and skipped the
+            // overlay-side remove, so we have to do it here.
+            let overlay_path = self
+                .overlay_backing
+                .is_some()
+                .then(|| inodes.get(ino).map(|e| e.full_path.clone()))
+                .flatten();
+            let orphan = inodes.remove_orphan(ino);
+            let evicted = inodes.take_evict_pending(ino) && inodes.evict_if_safe(ino);
+            let removed = orphan || evicted;
+            let is_clean = !removed && inodes.get(ino).is_some_and(|entry| !entry.is_dirty());
+            (removed, is_clean, overlay_path.filter(|_| removed))
+        };
+        if removed {
+            if let Some(path) = overlay_path {
+                if let Err(e) = self.remove_local_backing_file(ino, &path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!("Failed to remove overlay file for ino={} on release: {}", ino, e);
+                }
+            } else {
+                self.drop_staging(ino);
+            }
+        } else if is_clean && self.staging.gc_one(ino, &self.inode_table).await {
+            debug!("staging GC: removed ino={} on release", ino);
         }
     }
 
@@ -2642,17 +2713,34 @@ impl VirtualFs {
     async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
         assert!(!self.overlay(), "overlay forces advanced_writes; streaming unreachable");
 
-        // Unlinked files (nlink=0) must not be re-committed on close —
-        // user deleted the file, uploading would resurrect it.
-        if self
-            .inode_table
-            .read()
-            .expect("inodes poisoned")
-            .get(ino)
-            .is_some_and(|e| e.nlink == 0)
-        {
-            debug!("streaming_commit: skipping unlinked ino={}", ino);
+        // Unlinked files (nlink=0) must not be re-committed on close — user
+        // deleted the file, uploading would resurrect it. A superseded
+        // channel (a newer O_TRUNC writer bumped the dirty generation, and
+        // may have committed already) must not commit either: its AddFile
+        // would roll the remote back over the successor's bytes. Both checks
+        // run under the per-inode staging lock held by every commit driver,
+        // so they cannot go stale before the Hub call.
+        let skip_commit = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            match inodes.get(ino) {
+                Some(entry) => entry.nlink == 0 || !channel.owns_generation(entry.dirty_generation),
+                None => true,
+            }
+        };
+        if skip_commit {
+            debug!("streaming_commit: skipping unlinked or superseded ino={}", ino);
             return Ok(());
+        }
+
+        // Flip to Committing under the state mutex BEFORE enqueueing Finish:
+        // write() enqueues Data under the same mutex, so a racing write either
+        // lands ahead of Finish or observes Committing and is rejected instead
+        // of being silently dropped behind Finish.
+        {
+            let mut state = channel.state.lock().expect("state poisoned");
+            if matches!(&*state, CommitState::Writing | CommitState::Deferred) {
+                *state = CommitState::Committing;
+            }
         }
 
         let file_info = {
@@ -2733,6 +2821,11 @@ impl VirtualFs {
             file_info.hash(),
             file_info.file_size().expect("upload returned XetFileInfo without size"),
         );
+
+        // Transition to Committed while still holding the commit lock, so a
+        // waiting concurrent caller observes it. Callers re-set it after we
+        // return (harmless) — they cannot do it under the lock.
+        *channel.state.lock().expect("state poisoned") = CommitState::Committed;
 
         Ok(())
     }
@@ -2911,6 +3004,7 @@ impl VirtualFs {
             );
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.children_loaded_at = Some(Instant::now());
+                entry.created_locally = true;
                 // children_from_remote stays false: a freshly-mkdir'd dir has
                 // no remote presence yet, so lookup-miss can serve ENOENT
                 // without HEAD/list_tree probes.
@@ -2941,6 +3035,116 @@ impl VirtualFs {
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
         Ok(self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?))
+    }
+
+    /// Phase-1a source read for `link()`: `Ok(None)` means the source exists
+    /// but has no committed hash yet (dirty, or created and never flushed).
+    fn link_source(&self, ino: u64) -> VirtualFsResult<Option<LinkSource>> {
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        let source = inodes.get(ino).ok_or(libc::ENOENT)?;
+        if source.kind != InodeKind::File {
+            return Err(libc::EPERM);
+        }
+        if source.is_dirty() {
+            return Ok(None);
+        }
+        let Some(hash) = source.xet_hash.as_ref().filter(|hash| !hash.is_empty()).cloned() else {
+            return Ok(None);
+        };
+        Ok(Some(LinkSource {
+            path: source.full_path.clone(),
+            xet_hash: hash,
+            size: source.size,
+            mode: source.mode,
+            uid: source.uid,
+            gid: source.gid,
+        }))
+    }
+
+    /// Find the open streaming channel that owns `ino`'s current dirty bytes:
+    /// non-terminal state, and `dirty_generation_at_open` matching the
+    /// inode's current dirty generation (the same token streaming_commit
+    /// uses for clear_dirty_if). Multiple streaming handles can coexist on
+    /// one inode (a flushed-but-still-open handle plus a newer O_TRUNC
+    /// writer), and HashMap iteration order is arbitrary — a stale channel
+    /// must not shadow the active writer. The state filter matters because
+    /// generations are reused: a successful commit resets the inode's
+    /// generation to 0, so a committed-but-open generation-1 channel and the
+    /// next O_TRUNC writer would both match generation 1.
+    fn streaming_channel_for(&self, ino: u64) -> Option<Arc<StreamingChannel>> {
+        let current_generation = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            inodes.get(ino)?.dirty_generation
+        };
+        let files = self.open_files.read().expect("open_files poisoned");
+        files.values().find_map(|open| match open {
+            OpenFile::Streaming { ino: open_ino, channel }
+                if *open_ino == ino
+                    && channel.owns_generation(current_generation)
+                    && !matches!(
+                        &*channel.state.lock().expect("state poisoned"),
+                        CommitState::Committed | CommitState::Failed(_)
+                    ) =>
+            {
+                Some(Arc::clone(channel))
+            }
+            _ => None,
+        })
+    }
+
+    /// Defer a streaming channel's commit to release(): install the hook so
+    /// concurrent open() can wait on the outcome, then demote the state.
+    /// Only a channel still in `Writing` is demoted: overwriting `Committing`
+    /// would reopen the lost-write race the state exists to close (a write()
+    /// could pass the Writing|Deferred gate and enqueue bytes behind an
+    /// in-flight Finish), and Committed/Failed are terminal.
+    ///
+    /// Deferral runs without the per-inode staging lock, so an O_TRUNC
+    /// supersede can flip the channel to Failed between flush()'s state check
+    /// and this call; install_commit_hook fulfills the hook on the spot in
+    /// that case.
+    fn defer_commit(&self, ino: u64, channel: &StreamingChannel) {
+        self.install_commit_hook(ino, channel);
+        let mut state = channel.state.lock().expect("state poisoned");
+        if matches!(&*state, CommitState::Writing) {
+            *state = CommitState::Deferred;
+        }
+    }
+
+    /// Terminal streaming-commit sequence, shared by `flush()` and `link()`:
+    /// per-inode lock → error check → state check → install hook → commit →
+    /// mark Committed → fulfill hook. On error the hook stays active and
+    /// pending_info is preserved so release() retries and publishes the final
+    /// outcome; concurrent open(O_TRUNC) waits on the hook instead of racing
+    /// the retry. The per-inode staging lock serializes every streaming
+    /// commit driver (flush/link/release) plus writer creation and unlink:
+    /// without it, a release() racing a link()-initiated commit would observe
+    /// `Committing`, re-run the commit against the in-flight one, and fail
+    /// with a spurious EIO (plus an inode revert racing the successful
+    /// commit).
+    async fn commit_streaming_now(&self, ino: u64, channel: &Arc<StreamingChannel>) -> VirtualFsResult<()> {
+        let staging_mutex = self.staging.lock(ino);
+        let _commit_guard = staging_mutex.lock().await;
+        if let Some(err) = channel.error.lock().expect("error poisoned").as_ref() {
+            return Err(err.to_errno());
+        }
+        {
+            let state = channel.state.lock().expect("state poisoned");
+            match &*state {
+                CommitState::Committed => return Ok(()),
+                CommitState::Failed(msg) => {
+                    debug!("streaming commit already failed for ino={}: {}", ino, msg);
+                    return Err(libc::EIO);
+                }
+                CommitState::Writing | CommitState::Deferred | CommitState::Committing => {}
+            }
+        }
+        // Install hook before commit so concurrent open() can wait on us.
+        self.install_commit_hook(ino, channel);
+        self.streaming_commit(ino, channel).await?;
+        *channel.state.lock().expect("state poisoned") = CommitState::Committed;
+        self.fulfill_commit_hook(ino, channel, Ok(()));
+        Ok(())
     }
 
     /// Hard-link `ino` at `newparent/newname` as a server-side copy: a new Hub
@@ -2974,26 +3178,21 @@ impl VirtualFs {
         // destination's remote children. A rejected source (dirty or hashless,
         // the routine *arr link-then-copy fallback) must not pay for a
         // list_tree it would throw away.
-        let (source_path, xet_hash, size, mode, uid, gid) = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            let source = inodes.get(ino).ok_or(libc::ENOENT)?;
-            if source.kind != InodeKind::File {
-                return Err(libc::EPERM);
-            }
-            if source.is_dirty() {
-                return Err(libc::ENOTSUP);
-            }
-            let Some(hash) = source.xet_hash.as_ref().filter(|hash| !hash.is_empty()).cloned() else {
-                return Err(libc::ENOTSUP);
-            };
-            (
-                source.full_path.clone(),
-                hash,
-                source.size,
-                source.mode,
-                source.uid,
-                source.gid,
-            )
+        //
+        // A dirty source with an open streaming handle gets one synchronous
+        // commit (same sequence as flush()): object_store-based writers
+        // (Lance, Delta) emulate atomic rename as write → hard_link → unlink
+        // → close, so their link() arrives before the close-time commit. The
+        // commit itself waits until the destination has validated — a link
+        // that fails EEXIST/ENOTDIR must not leave remote mutation behind.
+        let source = self.link_source(ino)?;
+        let dirty_channel = if source.is_none() {
+            // Dirty with no committable handle (the routine *arr
+            // link-then-copy fallback): reject before paying for the
+            // destination list_tree below.
+            Some(self.streaming_channel_for(ino).ok_or(libc::ENOTSUP)?)
+        } else {
+            None
         };
 
         // Load remote children so the EEXIST check below also sees files that
@@ -3015,21 +3214,29 @@ impl VirtualFs {
             new_full_path
         };
 
+        let source = match dirty_channel {
+            Some(channel) => {
+                self.commit_streaming_now(ino, &channel).await?;
+                self.link_source(ino)?.ok_or(libc::ENOTSUP)?
+            }
+            None => source.ok_or(libc::ENOTSUP)?,
+        };
+
         // Phase 2: commit the alias to the Hub.
         let now = SystemTime::now();
         let mtime_ms = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let ops = [BatchOp::AddFile {
             path: new_full_path.clone(),
-            xet_hash: xet_hash.clone(),
+            xet_hash: source.xet_hash.clone(),
             mtime: mtime_ms,
             content_type: None,
         }];
         if let Err(e) = self.hub_client.batch_operations(&ops).await {
             error!(
                 "link: failed to commit {} as alias of {}: {}",
-                new_full_path, source_path, e
+                new_full_path, source.path, e
             );
-            return Err(libc::EIO);
+            return Err(e.to_errno());
         }
 
         self.negative_cache_remove(&new_full_path);
@@ -3045,21 +3252,26 @@ impl VirtualFs {
         }
         // A concurrent create may have won the race since phase 1; the remote
         // add already landed, but locally the newer entry owns the name.
+        // Accepted TOCTOU: in this narrow window a failed link leaves the
+        // alias (and, for a dirty source, the source commit) on the Hub —
+        // same trade-off as pre-existing clean-source links. Deterministic
+        // validation failures (EEXIST/ENOTDIR/ENOENT in phase 1b) commit
+        // nothing.
         if inodes.lookup_child(newparent, newname).is_some() {
             return Err(libc::EEXIST);
         }
-        info!("Linked {} -> {} (server-side copy)", source_path, new_full_path);
+        info!("Linked {} -> {} (server-side copy)", source.path, new_full_path);
         let new_ino = inodes.insert(
             newparent,
             newname.to_string(),
             new_full_path,
             InodeKind::File,
-            size,
+            source.size,
             now,
-            Some(xet_hash),
-            mode,
-            uid,
-            gid,
+            Some(source.xet_hash),
+            source.mode,
+            source.uid,
+            source.gid,
         );
         inodes.touch_parent(newparent, now);
         inodes.touch(new_ino);
@@ -3076,13 +3288,47 @@ impl VirtualFs {
 
         self.ensure_children_loaded(parent).await?;
 
-        let (ino, full_path, needs_remote_delete) = {
+        // In streaming mode, serialize against in-flight streaming commits
+        // AND writer creation (both hold the same per-inode staging lock)
+        // before snapshotting: a commit landing between the snapshot and the
+        // local removal would flip the file to committed-with-hash after
+        // needs_remote_delete was computed as false, leaving the freshly
+        // committed remote file undeleted — and a writer created after a
+        // per-channel check would dodge a channel-scoped lock entirely.
+        // Lock-then-revalidate loop: a concurrent rename can replace
+        // `parent/name` with a different inode between the lookup and the
+        // lock acquisition, and holding the OLD inode's lock would leave the
+        // replacement unserialized. Advanced mode takes no lock, so it skips
+        // the pre-lookup and never retries.
+        let (ino, full_path, needs_remote_delete, dirty, commit_guard) = loop {
+            let (locked_ino, commit_guard) = if !self.advanced_writes {
+                let target_ino = {
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    match inodes.lookup_child(parent, name) {
+                        Some(entry) if entry.kind != InodeKind::Directory => entry.inode,
+                        Some(_) => return Err(libc::EISDIR),
+                        None => return Err(libc::ENOENT),
+                    }
+                };
+                let staging_mutex = self.staging.lock(target_ino);
+                (Some(target_ino), Some(staging_mutex.lock_owned().await))
+            } else {
+                (None, None)
+            };
+
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let entry = match inodes.lookup_child(parent, name) {
                 Some(entry) if entry.kind != InodeKind::Directory => entry,
                 Some(_) => return Err(libc::EISDIR),
                 None => return Err(libc::ENOENT),
             };
+            // The name changed owners while we were acquiring the lock —
+            // release it (scope end) and re-serialize on the new inode.
+            if let Some(locked_ino) = locked_ino
+                && entry.inode != locked_ino
+            {
+                continue;
+            }
             // Overlay: cannot delete clean remote entries (no whiteout support).
             // Deleting dirty (local) entries is allowed; remote reappears on remount.
             if self.is_overlay_immutable(entry) {
@@ -3091,15 +3337,31 @@ impl VirtualFs {
             // Remote delete only when last link is removed and file exists on the hub.
             // Skipped in overlay mode (writes never propagate to remote).
             let needs_remote = !self.overlay() && entry.xet_hash.is_some() && entry.nlink <= 1;
-            (entry.inode, entry.full_path.to_string(), needs_remote)
+            break (
+                entry.inode,
+                entry.full_path.to_string(),
+                needs_remote,
+                entry.is_dirty(),
+                commit_guard,
+            );
         };
 
-        // In streaming mode, block unlink while the file has any open handles.
-        // This prevents editors (vim) from deleting a file they can't rewrite
-        // (streaming mode returns EPERM for O_RDWR without O_TRUNC), which
-        // would cause silent data loss. Same approach as mountpoint-s3.
-        if !self.advanced_writes && self.has_open_handles(ino) {
-            debug!("unlink: blocked for ino={} (has open handles in streaming mode)", ino);
+        // In streaming mode, block unlink while the file has open handles AND
+        // uncommitted changes: deleting out from under an editor mid-rewrite
+        // (vim can't rewrite in place in streaming mode and may fall back to
+        // unlink + recreate) would silently lose the un-committed bytes. Same
+        // approach as mountpoint-s3.
+        //
+        // Clean inodes get POSIX unlink-while-open semantics instead: the
+        // entry goes away now and open handles keep reading via the committed
+        // hash / staging file until release() reaps the orphan. This is what
+        // object_store-based writers (Lance, Delta) rely on for staging
+        // cleanup and recursive dataset deletes.
+        if !self.advanced_writes && dirty && self.has_open_handles(ino) {
+            debug!(
+                "unlink: blocked for ino={} (dirty with open handles in streaming mode)",
+                ino
+            );
             return Err(libc::EPERM);
         }
 
@@ -3116,7 +3378,7 @@ impl VirtualFs {
                 .await
             {
                 error!("Remote delete failed for {}: {}", full_path, e);
-                return Err(libc::EIO);
+                return Err(e.to_errno());
             }
         }
 
@@ -3148,6 +3410,16 @@ impl VirtualFs {
         // otherwise HEAD the still-existing remote (the delete is only queued)
         // and resurrect this name locally during the drop_locked await window.
         self.negative_cache_insert(full_path.clone());
+
+        // The commit/creation serialization is complete (remote delete and
+        // local unlink both done); release the per-inode lock before
+        // drop_locked re-acquires it below, then evict the lock-map entry if
+        // unused — mass deletes (Lance drop_table) would otherwise grow the
+        // map by one entry per deleted file for the life of the mount.
+        if commit_guard.is_some() {
+            drop(commit_guard);
+            self.staging.forget_lock_if_unused(ino);
+        }
 
         // Clean up staging file only when the inode is actually gone. With an
         // open fd, drop_staging waits until release() so writes through the
@@ -3371,8 +3643,14 @@ impl VirtualFs {
             self.ensure_children_loaded(dst_ino).await?;
         }
 
-        // Phase 1: validate under read lock, collect everything we need
+        // Phase 1: validate, mark the entries, collect everything we need
         let info = self.rename_validate(parent, name, newparent, newname, no_replace)?;
+        // Held until the entries are moved locally: see `InodeTable::renames`.
+        let _renaming = RenameMark {
+            inode_table: &self.inode_table,
+            old_path: info.old_path.clone(),
+            new_path: info.new_full_path.clone(),
+        };
 
         // POSIX: rename(a, b) where a and b are hard links to the same inode is a no-op.
         // Check before remote sync to avoid spurious backend mutations.
@@ -3449,7 +3727,7 @@ impl VirtualFs {
         }
     }
 
-    /// Phase 1: validate rename under inode read lock, return all info needed for phases 2+3.
+    /// Phase 1: validate rename and register it as in flight, return all info needed for phases 2+3.
     fn rename_validate(
         &self,
         parent: u64,
@@ -3458,7 +3736,10 @@ impl VirtualFs {
         newname: &str,
         no_replace: bool,
     ) -> VirtualFsResult<RenameInfo> {
-        let inodes = self.inode_table.read().expect("inodes poisoned");
+        // A write lock, so that the rename is registered (`InodeTable::renames`)
+        // in the same critical section as the validation: no remote deletion
+        // can drop an entry in between.
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
 
         let src = inodes.lookup_child(parent, name).ok_or(libc::ENOENT)?;
 
@@ -3535,7 +3816,7 @@ impl VirtualFs {
             Vec::new()
         };
 
-        Ok(RenameInfo {
+        let info = RenameInfo {
             ino: src.inode,
             old_path: src.full_path.to_string(),
             kind: src.kind,
@@ -3543,7 +3824,9 @@ impl VirtualFs {
             is_dirty: src.is_dirty(),
             new_full_path,
             descendant_files,
-        })
+        };
+        inodes.add_rename(info.old_path.clone(), info.new_full_path.clone());
+        Ok(info)
     }
 
     /// Phase 2: send batch rename ops to the Hub (add new paths + delete old ones).
@@ -3601,7 +3884,7 @@ impl VirtualFs {
         );
         if let Err(e) = self.hub_client.batch_operations(&ops).await {
             error!("Failed to rename {} -> {}: {}", info.old_path, info.new_full_path, e);
-            return Err(libc::EIO);
+            return Err(e.to_errno());
         }
         debug!("rename_remote: success");
         Ok(true)
@@ -3955,8 +4238,26 @@ struct RenameInfo {
     xet_hash: Option<String>,
     is_dirty: bool,
     new_full_path: String,
-    /// Descendant clean files to rename on the remote (dir renames only).
+    /// Descendant clean files to rename on the remote (dir renames only):
+    /// old path and xet hash.
     descendant_files: Vec<(String, String)>,
+}
+
+/// Unregisters the rename `rename_validate` registered (`InodeTable::renames`)
+/// when dropped, also on error.
+struct RenameMark<'a> {
+    inode_table: &'a RwLock<InodeTable>,
+    old_path: String,
+    new_path: String,
+}
+
+impl Drop for RenameMark<'_> {
+    fn drop(&mut self) {
+        self.inode_table
+            .write()
+            .expect("inodes poisoned")
+            .remove_rename(&self.old_path, &self.new_path);
+    }
 }
 
 // ── Internal types ─────────────────────────────────────────────────────
@@ -3969,7 +4270,6 @@ struct FileEntry {
     full_path: String,
 }
 
-/// State machine for streaming writes.
 /// Message sent from the write() caller to the background streaming worker.
 enum WriteMsg {
     Data(Vec<u8>),
@@ -3978,6 +4278,7 @@ enum WriteMsg {
 
 /// Snapshot of inode state captured when a streaming writer is opened.
 /// Used to revert the inode on commit failure (data loss recovery).
+#[derive(Clone)]
 struct InodeSnapshot {
     xet_hash: Option<String>,
     size: u64,
@@ -3993,6 +4294,10 @@ enum CommitState {
     Writing,
     /// flush() deferred commit (dup'd fd or zero writes). release() will handle it.
     Deferred,
+    /// A commit is in flight: Finish is (about to be) enqueued. Writes are
+    /// rejected from this point — they would land behind Finish and be
+    /// silently dropped by the exiting worker.
+    Committing,
     /// Commit completed successfully.
     Committed,
     /// Unrecoverable error — inode has been reverted.
@@ -4026,15 +4331,54 @@ struct StreamingChannel {
     commit_hook: std::sync::Mutex<Option<CommitHookTx>>,
 }
 
+/// Committed source attributes read under lock for `link()`.
+struct LinkSource {
+    path: Arc<str>,
+    xet_hash: String,
+    size: u64,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+}
+
+impl StreamingChannel {
+    /// True when this channel owns the inode's current dirty bytes: its
+    /// generation-at-open matches the inode's dirty generation (the same
+    /// token streaming_commit hands to clear_dirty_if). False once a newer
+    /// O_TRUNC writer bumped the generation, or after commit/revert reset it.
+    fn owns_generation(&self, inode_dirty_generation: u64) -> bool {
+        self.dirty_generation_at_open.load(Ordering::Relaxed) == inode_dirty_generation
+    }
+}
+
+/// Outcome of `VirtualFs::head_probe`.
+enum HeadProbe {
+    File(crate::hub_api::HeadFileInfo),
+    Inconclusive,
+    Transient(crate::error::Error),
+}
+
+/// The channel's final commit outcome once it reached a terminal state
+/// (Committed or Failed). Terminal states never regress, so an unlocked read
+/// is stable.
+fn terminal_result(channel: &StreamingChannel) -> Option<Result<(), i32>> {
+    match &*channel.state.lock().expect("state poisoned") {
+        CommitState::Committed => Some(Ok(())),
+        CommitState::Failed(_) => Some(Err(libc::EIO)),
+        _ => None,
+    }
+}
+
+fn channel_is_terminal(channel: &StreamingChannel) -> bool {
+    terminal_result(channel).is_some()
+}
+
 /// An open file handle — either a local fd, lazy remote reference, or streaming writer.
 enum OpenFile {
     /// Local file (staging for writes, or dirty reads).
     Local { ino: u64, file: Arc<File>, writable: bool },
-    /// Lazy remote — data fetched on-demand with adaptive prefetch buffer.
-    Lazy {
-        ino: u64,
-        prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
-    },
+    /// Lazy remote: data fetched on demand, with read-ahead.
+    Lazy { ino: u64, reader: Arc<RemoteReader> },
     /// Streaming append-only writer (default write mode).
     Streaming { ino: u64, channel: Arc<StreamingChannel> },
 }
@@ -4115,9 +4459,7 @@ async fn streaming_worker(
 enum ReadTarget {
     /// Hold an Arc<File> so the FD stays alive even if release() runs concurrently.
     LocalFd(Arc<File>),
-    Remote {
-        prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
-    },
+    Remote(Arc<RemoteReader>),
 }
 
 #[cfg(test)]

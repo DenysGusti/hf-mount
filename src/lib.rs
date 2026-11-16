@@ -2,6 +2,7 @@ pub mod cached_xet_client;
 pub mod daemon;
 pub mod error;
 pub mod file_cache;
+pub mod follow;
 #[cfg(feature = "fuse")]
 pub mod fuse;
 pub mod hub_api;
@@ -10,6 +11,7 @@ pub mod nfs;
 pub mod overlay;
 pub mod setup;
 pub mod virtual_fs;
+pub mod window_plans;
 pub mod xet;
 pub mod acc_mount;
 

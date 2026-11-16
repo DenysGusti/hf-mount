@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+use xet_data::processing::XetFileInfo;
 
+use crate::error::{Error, Result};
 use crate::hub_api::{BatchOp, HubOps};
 use crate::xet::XetOps;
 
@@ -17,6 +19,43 @@ enum FlushSignal {
     Dirty(u64),
     /// Wake the loop to drain pending remote deletes (no dirty inode attached).
     WakeDeletes,
+    /// Close the batch being collected now (periodic flush), instead of
+    /// waiting for the debounce to expire.
+    Tick,
+}
+
+/// An upload batch still running after this logs an error: the mount is not
+/// persisting, and writers to these files wait on their staging locks.
+const UPLOAD_SLOW_AFTER: Duration = Duration::from_secs(60);
+/// Bound on one `upload_files` call: above xet-core's own retry budget
+/// (6 min), plus the batch size at `UPLOAD_MIN_RATE`, so a request that never
+/// answers cannot stall every later flush, and a large batch still has time.
+#[cfg(not(test))]
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+#[cfg(test)]
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(2);
+const UPLOAD_MIN_RATE: u64 = 1024 * 1024;
+
+async fn upload_with_timeout(
+    xet_sessions: &dyn XetOps,
+    staging_paths: &[&Path],
+    bytes: u64,
+) -> Result<Vec<XetFileInfo>> {
+    let timeout = UPLOAD_TIMEOUT + Duration::from_secs(bytes / UPLOAD_MIN_RATE);
+    let upload = xet_sessions.upload_files(staging_paths);
+    tokio::pin!(upload);
+    let slow_after = UPLOAD_SLOW_AFTER.min(timeout);
+    if let Ok(result) = tokio::time::timeout(slow_after, &mut upload).await {
+        return result;
+    }
+    error!(
+        "Batch upload of {} file(s) still running after {:?}, flushes are blocked",
+        staging_paths.len(),
+        slow_after
+    );
+    tokio::time::timeout(timeout - slow_after, upload)
+        .await
+        .unwrap_or_else(|_| Err(Error::Xet(format!("upload timed out after {timeout:?}"))))
 }
 
 // ── FlushManager ──────────────────────────────────────────────────────
@@ -42,11 +81,32 @@ impl FlushManager {
         runtime: &tokio::runtime::Handle,
         debounce: Duration,
         max_batch_window: Duration,
+        interval: Duration,
     ) -> Self {
         let errors = Arc::new(Mutex::new(HashMap::new()));
         let pending_deletes = Arc::new(Mutex::new(Vec::new()));
 
         let (tx, rx) = mpsc::unbounded_channel::<FlushSignal>();
+        if !interval.is_zero() {
+            // Periodic flush of open dirty files (long-lived writers never
+            // release()). A weak sender so this task cannot keep the channel
+            // open past shutdown; it exits once the flush loop is gone.
+            let weak_tx = tx.downgrade();
+            let inodes = inodes.clone();
+            runtime.spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let Some(tx) = weak_tx.upgrade() else { return };
+                    let dirty = inodes.read().expect("inodes poisoned").dirty_inos();
+                    let signals = dirty.into_iter().map(FlushSignal::Dirty).chain([FlushSignal::Tick]);
+                    for signal in signals {
+                        if tx.send(signal).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
         let bg_errors = errors.clone();
         let bg_deletes = pending_deletes.clone();
         let bg_hub = hub_client.clone();
@@ -189,7 +249,7 @@ impl FlushManager {
 
 /// Run a blocking closure, using `block_in_place` when called from within the
 /// Tokio runtime (e.g. NFS shutdown) and directly otherwise (e.g. FUSE destroy).
-fn run_blocking<F: FnOnce()>(f: F) {
+pub(super) fn run_blocking<F: FnOnce()>(f: F) {
     if tokio::runtime::Handle::try_current().is_ok() {
         tokio::task::block_in_place(f);
     } else {
@@ -214,6 +274,7 @@ async fn flush_loop(
     loop {
         // Wait for the first signal
         let first = match rx.recv().await {
+            Some(FlushSignal::Tick) => continue, // nothing was dirty
             Some(sig) => sig,
             None => return, // channel closed, exit
         };
@@ -230,6 +291,7 @@ async fn flush_loop(
             }
             let timeout = debounce.min(remaining);
             match tokio::time::timeout(timeout, rx.recv()).await {
+                Ok(Some(FlushSignal::Tick)) => break, // periodic flush: batch closes now
                 Ok(Some(sig)) => signals.push(sig),
                 _ => break, // timeout (debounce expired) or channel closed
             }
@@ -243,7 +305,7 @@ async fn flush_loop(
             .into_iter()
             .filter_map(|sig| match sig {
                 FlushSignal::Dirty(ino) => Some(ino),
-                FlushSignal::WakeDeletes => None,
+                FlushSignal::WakeDeletes | FlushSignal::Tick => None,
             })
             .collect();
 
@@ -302,6 +364,7 @@ struct FlushItem {
     staging_path: PathBuf,
     pending_deletes: Vec<String>,
     dirty_generation: u64,
+    size: u64,
     /// Hash from the last successful commit, used to skip redundant Hub commits
     /// when the CAS upload produces the same hash (content unchanged).
     prev_xet_hash: Option<String>,
@@ -368,6 +431,7 @@ async fn flush_batch(
                     staging_path,
                     pending_deletes: entry.pending_deletes.clone(),
                     dirty_generation: entry.dirty_generation,
+                    size: entry.size,
                     prev_xet_hash: entry.xet_hash.clone(),
                 })
             })
@@ -389,8 +453,9 @@ async fn flush_batch(
     let mut upload_results = Vec::with_capacity(to_flush.len());
 
     for (chunk_idx, chunk) in to_flush.chunks(UPLOAD_CHUNK_SIZE).enumerate() {
-        let staging_paths: Vec<&std::path::Path> = chunk.iter().map(|item| item.staging_path.as_path()).collect();
-        match xet_sessions.upload_files(&staging_paths).await {
+        let staging_paths: Vec<&Path> = chunk.iter().map(|item| item.staging_path.as_path()).collect();
+        let bytes: u64 = chunk.iter().map(|item| item.size).sum();
+        match upload_with_timeout(xet_sessions, &staging_paths, bytes).await {
             Ok(results) => {
                 assert_eq!(
                     results.len(),

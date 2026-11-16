@@ -321,8 +321,9 @@ impl VirtualFs {
             self.inode_table.clone(),
             self.negative_cache.clone(),
             self.invalidator.clone(),
-            Duration::ZERO,
+            Some(Duration::ZERO),
             REFRESH_LISTING_CONCURRENCY,
+            false,
         ));
         let finished = tokio::time::timeout(REFRESH_ROUND_TIMEOUT, hub.finished.notified()).await;
         task.abort();

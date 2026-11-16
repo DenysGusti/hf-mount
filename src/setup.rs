@@ -1,6 +1,8 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use tracing::{info, warn};
@@ -14,7 +16,13 @@ use crate::file_cache::FileCache;
 use crate::hub_api::{HubApiClient, HubOps, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
 use crate::overlay::OverlayBacking;
 use crate::virtual_fs::{VfsConfig, VirtualFs};
+use crate::window_plans::{WindowPlans, WindowPlansMode};
 use crate::xet::{StagingDir, XetSessions};
+
+/// Name hf-mount registers its FUSE mounts under (fuser `FSName`, i.e. the
+/// mount source; the CSI helper uses it as the `fuse.<subtype>`). The
+/// dead-mount detector matches on it, so the two must stay in sync.
+pub const FS_NAME: &str = "hf-mount";
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum CacheMode {
@@ -40,9 +48,40 @@ pub enum Source {
         /// Local directory where the filesystem will be mounted
         mount_point: PathBuf,
         /// Git revision to mount
-        #[arg(long, default_value = "main")]
+        #[arg(long, default_value = "main", value_parser = validate_revision)]
         revision: String,
     },
+}
+
+/// Validate a repo revision against a git-ref-safe character allowlist. The
+/// value flows into Hub URLs and the args file, where a `?` would split the URL
+/// into a query string and smuggle the trailing text on. An allowlist refuses
+/// anything unanticipated; branches, tags, slashed branches and SHAs all pass.
+/// Parse an octal permission string such as `0755`, `755` or `0o777`.
+fn parse_mode(s: &str) -> Result<u16, String> {
+    let digits = s.strip_prefix("0o").unwrap_or(s);
+    let mode = u16::from_str_radix(digits, 8).map_err(|_| format!("{s:?} is not an octal permission mode"))?;
+    if mode > 0o7777 {
+        return Err(format!("{s:?} exceeds the maximum permission mode 07777"));
+    }
+    Ok(mode)
+}
+
+fn validate_revision(s: &str) -> Result<String, String> {
+    if s.is_empty() {
+        return Err("revision must not be empty".to_string());
+    }
+    if let Some(c) = s
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')))
+    {
+        return Err(format!("revision contains an invalid character: {c:?}"));
+    }
+    // `..` is invalid in a git ref and would let the revision traverse the Hub URL path.
+    if s.contains("..") {
+        return Err("revision must not contain '..'".to_string());
+    }
+    Ok(s.to_string())
 }
 
 impl Source {
@@ -95,6 +134,16 @@ pub struct MountOptions {
     #[arg(long)]
     pub gid: Option<u32>,
 
+    /// Permission bits (octal) reported for directories listed from the remote.
+    /// Entries created through the mount keep the mode they were created with.
+    #[arg(long, default_value = "0755", value_parser = parse_mode)]
+    pub dir_mode: u16,
+
+    /// Permission bits (octal) reported for files listed from the remote.
+    /// Entries created through the mount keep the mode they were created with.
+    #[arg(long, default_value = "0644", value_parser = parse_mode)]
+    pub file_mode: u16,
+
     /// Mount in read-only mode (no writes allowed)
     #[arg(long, default_value_t = false)]
     pub read_only: bool,
@@ -116,6 +165,15 @@ pub struct MountOptions {
     /// mounts poll in parallel.
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..))]
     pub poll_listing_concurrency: u32,
+
+    /// Subscribe to the Hub's bucket live-follow event stream (SSE) so remote
+    /// changes are applied as they happen instead of waiting for the next
+    /// poll round. Falls back to interval polling automatically when the Hub
+    /// doesn't serve the feed (older deployments, repo mounts). Works with
+    /// `--poll-interval-secs 0` too (no fallback then). Disable with
+    /// `--live-follow=false`.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub live_follow: bool,
 
     /// Maximum size in bytes for the on-disk chunk cache.
     #[arg(long, default_value_t = 10_000_000_000)]
@@ -160,26 +218,55 @@ pub struct MountOptions {
     #[arg(long, default_value_t = false)]
     pub metadata_ttl_minimal: bool,
 
+    /// How long a lookup miss (ENOENT) is remembered before the path is
+    /// re-probed on the Hub, in milliseconds. This is a rate limit on HEAD
+    /// requests for missing paths, and the upper bound on how long a file
+    /// added remotely stays hidden from a client that probed it too early.
+    #[arg(long, default_value_t = 1_000)]
+    pub negative_ttl_ms: u64,
+
     /// Maximum number of FUSE worker threads
     #[arg(long, default_value_t = 16)]
     pub max_threads: usize,
 
-    /// Maximum time (ms) a single remote chunk fetch may stall before the read
-    /// is failed with EIO. Each FUSE `read()` blocks a worker thread on a
-    /// synchronous CAS/CDN fetch; without a ceiling, a stalled fetch (e.g. a
-    /// client-aborted media seek, a hung CDN connection) parks that thread
-    /// forever. After enough stalled reads accumulate, all `max_threads`
-    /// workers are wedged and the whole mount silently stops serving cold
-    /// reads. Bounding the per-chunk wait frees the thread (and cancels the
-    /// in-flight request by dropping the stream) so the mount stays alive.
+    /// Maximum time (ms) a remote fetch may wait for its next chunk of data.
+    /// A fetch that stalls longer (e.g. on a hung CDN connection) is cancelled
+    /// and retried, and after its last attempt the reads that wait for its
+    /// data fail with EIO instead of hanging forever. While other fetches of
+    /// the mount receive data, a fetch waits in line up to four times longer.
     /// 0 disables the timeout (legacy unbounded behaviour).
     #[arg(long, default_value_t = 30_000)]
     pub read_fetch_timeout_ms: u64,
+
+    /// Memory for read-ahead, shared by the files open on the mount, in MiB.
+    /// Files read at once split it, and one file holds at most 512 MiB of
+    /// it. Lower it where the daemon has a tight memory limit (with
+    /// HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT, which bounds the download
+    /// buffers of xet-core).
+    #[arg(long, default_value_t = 1024)]
+    pub read_ahead_mb: u64,
+
+    /// Reconstruction plans from one CAS request per GiB of a file read, instead
+    /// of three per 32 MiB fetch: hf-mount asks for the plan and the chunk layout
+    /// of a 1 GiB window and derives the plans inside it. `check` derives them,
+    /// compares them with the plans CAS returns, logs any difference, and uses
+    /// the CAS plans. Plans stay exact when CAS does not serve chunk layouts.
+    #[arg(long, value_enum, default_value_t = WindowPlansMode::Off)]
+    pub window_plans: WindowPlansMode,
 
     /// Flush debounce delay in milliseconds. After the first dirty file is
     /// enqueued, the flush batch waits this long for more writes before firing.
     #[arg(long, default_value_t = 2_000)]
     pub flush_debounce_ms: u64,
+
+    /// Advanced writes: also flush open dirty files every N milliseconds, so
+    /// a long-lived writer (a training log, an incrementally written
+    /// checkpoint) publishes without closing the file. Each cycle re-uploads
+    /// the whole staging file (CAS dedup keeps the network cost to the new
+    /// chunks) and may publish a partially written file. 0 disables (flush
+    /// on close/fsync only).
+    #[arg(long, default_value_t = 0)]
+    pub flush_interval_ms: u64,
 
     /// Maximum flush batch window in milliseconds. A dirty file will be flushed
     /// within this time regardless of ongoing writes resetting the debounce.
@@ -259,6 +346,69 @@ pub struct MountSetup {
 
 // ── Tracing + env vars (no threads) ──────────────────────────────────
 
+/// Upper bound on xet-core's adaptive upload concurrency. Each in-flight
+/// upload pins one serialized ~64MiB xorb in memory, so xet-core's default
+/// max of 64 lets a stalled CAS pin up to ~4GiB and get the FUSE daemon
+/// OOM-killed mid-write. 8 × 64MiB bounds that backlog at ~512MiB while
+/// still saturating healthy links. Set via env in `init_tracing` and read
+/// back from the effective config to catch upstream env renames.
+const XET_UPLOAD_CONCURRENCY_CAP: usize = 8;
+
+/// Whether the user pinned a fixed upload concurrency, which the adaptive
+/// cap must not override.
+fn user_fixed_upload_concurrency() -> bool {
+    std::env::var("HF_XET_FIXED_UPLOAD_CONCURRENCY").is_ok()
+}
+
+/// Whether the default for `key` must stay unset because the user pinned a
+/// fixed concurrency (`is_set` tells which variables are set). xet-runtime
+/// consults the HF_XET_FIXED_* aliases only when the canonical AC variables
+/// are absent: defaulting the canonical names would silently turn a fixed
+/// concurrency into an adaptive one.
+fn defers_to_fixed_concurrency(key: &str, is_set: impl Fn(&str) -> bool) -> bool {
+    (key.contains("UPLOAD_CONCURRENCY") && is_set("HF_XET_FIXED_UPLOAD_CONCURRENCY"))
+        || (key.contains("DOWNLOAD_CONCURRENCY") && is_set("HF_XET_FIXED_DOWNLOAD_CONCURRENCY"))
+}
+
+/// xet-core settings tuned for interactive FUSE reads (not batch downloads),
+/// applied as env defaults by `init_tracing`. xet-core ignores a value it
+/// cannot parse, so durations need a unit (`30s`, not `30`).
+fn xet_env_defaults(upload_cap: &str) -> Vec<(&'static str, &str)> {
+    vec![
+        ("HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY", "16"),
+        // Let the adaptive controller scale far enough to saturate fast links
+        // under many concurrent readers (xet-core's default cap is 64).
+        ("HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY", "124"),
+        ("HF_XET_CLIENT_AC_MIN_BYTES_REQUIRED_FOR_ADJUSTMENT", "4194304"),
+        ("HF_XET_RECONSTRUCTION_MIN_RECONSTRUCTION_FETCH_SIZE", "8388608"),
+        ("HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER", "8388608"),
+        ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30s"),
+        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "134217728"),
+        // Downloads in flight across the mount. One fast remote reader alone
+        // keeps up to 256 MiB in flight (virtual_fs/remote_reader.rs).
+        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "1073741824"),
+        // Per-read inactivity timeout for CAS/CDN transfers (resets on every byte
+        // received, so slow-but-progressing reads are fine). This governs the
+        // DOWNLOAD/reconstruction path (term fetches and whole-file downloads);
+        // shard uploads use a separate client with no read_timeout, so this no
+        // longer needs to be large for their sake. Keep it short so a stalled
+        // read fails fast and frees the FUSE worker thread instead of pinning it
+        // for minutes — a long value here is what let stalled reads accumulate
+        // and wedge the mount.
+        ("HF_XET_CLIENT_READ_TIMEOUT", "30s"),
+        // Upload tuning: skip slow adaptive concurrency ramp-up, but CAP the
+        // adaptive controller's upper bound (see XET_UPLOAD_CONCURRENCY_CAP).
+        ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", upload_cap),
+        ("HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY", upload_cap),
+        // Larger ingestion blocks = fewer CDC calls
+        ("HF_XET_DATA_INGESTION_BLOCK_SIZE", "16777216"),
+        // Upload sessions await their terminal telemetry document (up to 2 s
+        // by default) in finalize(), which a synchronous close() would pay on
+        // every write. Send it detached instead: the daemon outlives the POST.
+        ("HF_XET_TELEMETRY_FINAL_FLUSH_TIMEOUT", "0s"),
+    ]
+}
+
 /// Initialize tracing and xet-core env vars.
 /// No threads are spawned. Safe to fork() after this returns.
 pub fn init_tracing(daemon: bool) {
@@ -277,29 +427,11 @@ pub fn init_tracing(daemon: bool) {
         tracing_subscriber::fmt().with_env_filter(filter).with_ansi(ansi).init();
     }
 
-    // Tune xet-core for interactive FUSE reads (not batch downloads).
-    for (k, v) in [
-        ("HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY", "16"),
-        ("HF_XET_CLIENT_AC_MIN_BYTES_REQUIRED_FOR_ADJUSTMENT", "4194304"),
-        ("HF_XET_RECONSTRUCTION_MIN_RECONSTRUCTION_FETCH_SIZE", "8388608"),
-        ("HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER", "8388608"),
-        ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30"),
-        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "134217728"),
-        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "268435456"),
-        // Per-read inactivity timeout for CAS/CDN transfers (resets on every byte
-        // received, so slow-but-progressing reads are fine). This governs the
-        // DOWNLOAD/reconstruction path (term fetches and whole-file downloads);
-        // shard uploads use a separate client with no read_timeout, so this no
-        // longer needs to be large for their sake. Keep it short so a stalled
-        // read fails fast and frees the FUSE worker thread instead of pinning it
-        // for minutes — a long value here is what let stalled reads accumulate
-        // and wedge the mount.
-        ("HF_XET_CLIENT_READ_TIMEOUT", "30"),
-        // Upload tuning: skip slow adaptive concurrency ramp-up
-        ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", "16"),
-        // Larger ingestion blocks = fewer CDC calls
-        ("HF_XET_DATA_INGESTION_BLOCK_SIZE", "16777216"),
-    ] {
+    let upload_cap = XET_UPLOAD_CONCURRENCY_CAP.to_string();
+    for (k, v) in xet_env_defaults(&upload_cap) {
+        if defers_to_fixed_concurrency(k, |name| std::env::var(name).is_ok()) {
+            continue;
+        }
         if std::env::var(k).is_err() {
             // SAFETY: called before any threads are spawned.
             unsafe { std::env::set_var(k, v) };
@@ -378,14 +510,17 @@ pub fn build_with_runtime(
 
     let standard_client = if !is_accelerator {
         Some(runtime.block_on(async {
-            HubApiClient::from_source(
-                &options.hub_endpoint,
-                options.hf_token.as_deref(),
-                options.token_file.clone(),
-                source_kind.clone(),
-                path_prefix.clone(),
-                backend,
-            )
+  
+            retry_startup("Hub client init", || {
+                HubApiClient::from_source(
+                    &options.hub_endpoint,
+                    options.hf_token.as_deref(),
+                    options.token_file.clone(),
+                    source_kind.clone(),
+                    path_prefix.clone(),
+                    backend,
+                )
+            })
             .await
             .unwrap_or_else(|e| panic!("Failed to initialize Hub client: {e}"))
         }))
@@ -443,6 +578,20 @@ pub fn build_with_runtime(
     let remote_read_only = read_only || options.overlay;
     
     let xet_ctx = XetContext::default().expect("Failed to create XetContext");
+    
+    // The memory ceiling of the write path depends on the upload-concurrency
+    // cap set via env in `apply_xet_env_defaults`. The env names are owned by
+    // xet-core: if one is ever renamed upstream, the cap silently stops
+    // applying. Read back the effective value so that drift is loud instead
+    // of resurfacing as unbounded RSS under a stalled CAS.
+    if !user_fixed_upload_concurrency() && xet_ctx.config.client.ac_max_upload_concurrency > XET_UPLOAD_CONCURRENCY_CAP
+    {
+        warn!(
+            "xet upload concurrency cap not applied (effective max {}); write-path memory \
+             is not bounded — the HF_XET_CLIENT_AC_* env names may have changed upstream",
+            xet_ctx.config.client.ac_max_upload_concurrency
+        );
+    }
     let cas_config = if is_accelerator {
         let acc_ref = Arc::new(crate::acc_mount::AccTokenRefresher::new(
             acc_client.expect("Accelerator client should be initialized"),
@@ -492,12 +641,29 @@ pub fn build_with_runtime(
             false,
         ))
         .expect("Failed to create storage client");
-    let cached_client = CachedXetClient::new(raw_client);
+    let window_plans = (options.window_plans != WindowPlansMode::Off)
+        .then(|| WindowPlans::new(Arc::new(raw_client.clone()), options.window_plans));
+    let cached_client = CachedXetClient::with_window_plans(raw_client, window_plans.clone());
     let download_session = FileDownloadSession::from_client(&xet_ctx, cached_client.clone(), xorb_cache.clone());
     let upload_config = if remote_read_only { None } else { Some(cas_config) };
-    let xet_sessions = XetSessions::new(xet_ctx, download_session, upload_config, cached_client, xorb_cache);
+    let xet_sessions = XetSessions::new(
+        xet_ctx,
+        download_session,
+        upload_config,
+        cached_client,
+        xorb_cache,
+        window_plans,
+    );
 
     let advanced_writes = options.advanced_writes || options.overlay || (is_nfs && !read_only);
+
+    // A previous FUSE daemon may have died (OOM kill, crash) leaving a dead
+    // mount at the mount point: every stat() on it returns ENOTCONN, which
+    // would fail create_dir_all (below and in the overlay block) and the
+    // mount itself, crash-looping the restarted container until someone
+    // cleans the corpse up. Detach it so a fresh session can mount over a
+    // clean path. Must run before the overlay pre-mount fd is opened.
+    detach_dead_mount(&mount_point);
 
     // Overlay: open a pre-mount fd to the mount point directory. The fd is
     // held by OverlayBacking so overlay-local filesystem ops can stay rooted
@@ -537,6 +703,11 @@ pub fn build_with_runtime(
     if is_nfs && options.direct_io {
         info!("--direct-io is ignored for NFS mounts (no NFS equivalent)");
     }
+    if options.flush_interval_ms > 0 && (!advanced_writes || options.overlay) {
+        panic!(
+            "--flush-interval-ms requires --advanced-writes and no --overlay: streaming writes commit on close only, overlay writes never reach the Hub"
+        );
+    }
 
     let backend_name = if is_nfs { "nfs" } else { "fuse" };
     let path_prefix = standard_client.as_ref().map(|c| c.path_prefix()).unwrap_or("");
@@ -562,16 +733,19 @@ pub fn build_with_runtime(
     );
     info!(
         "Config: advanced_writes={} overlay={} remote_read_only={} direct_io={} poll_interval={}s \
-         poll_listing_concurrency={} metadata_ttl={}ms \
+         poll_listing_concurrency={} live_follow={} metadata_ttl={}ms negative_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} cache_mode={:?} max_staging_size={} max_threads={} \
-         flush_debounce={}ms flush_max_batch={}ms read_fetch_timeout={}ms uid={} gid={} filter_os_files={}",
+         flush_debounce={}ms flush_max_batch={}ms read_fetch_timeout={}ms read_ahead={}MiB uid={} gid={} \
+         dir_mode={:04o} file_mode={:04o} filter_os_files={}",
         advanced_writes,
         options.overlay,
         remote_read_only,
         options.direct_io,
         options.poll_interval_secs,
         options.poll_listing_concurrency,
+        options.live_follow,
         options.metadata_ttl_ms,
+        options.negative_ttl_ms,
         options.cache_dir,
         options.cache_size,
         options.no_disk_cache,
@@ -581,8 +755,11 @@ pub fn build_with_runtime(
         options.flush_debounce_ms,
         options.flush_max_batch_window_ms,
         options.read_fetch_timeout_ms,
+        options.read_ahead_mb,
         uid,
         gid,
+        options.dir_mode,
+        options.file_mode,
         !options.no_filter_os_files,
     );
 
@@ -600,16 +777,22 @@ pub fn build_with_runtime(
             advanced_writes,
             uid,
             gid,
+            dir_mode: options.dir_mode,
+            file_mode: options.file_mode,
             poll_interval_secs: options.poll_interval_secs,
             poll_listing_concurrency: options.poll_listing_concurrency as usize,
+            live_follow: options.live_follow,
             metadata_ttl,
+            negative_ttl: std::time::Duration::from_millis(options.negative_ttl_ms),
             serve_lookup_from_cache: !options.metadata_ttl_minimal,
             filter_os_files: !options.no_filter_os_files,
             direct_io: options.direct_io && !is_nfs,
             flush_debounce: std::time::Duration::from_millis(options.flush_debounce_ms),
             flush_max_batch_window: std::time::Duration::from_millis(options.flush_max_batch_window_ms),
+            flush_interval: std::time::Duration::from_millis(options.flush_interval_ms),
             flush_shutdown_timeout: std::time::Duration::from_millis(options.flush_shutdown_timeout_ms),
             read_fetch_timeout: std::time::Duration::from_millis(options.read_fetch_timeout_ms),
+            read_ahead_bytes: options.read_ahead_mb * 1_048_576,
             // NFS clients use inode numbers as stable file IDs; evicting an
             // inode the client still holds would surface as NFS3ERR_STALE on
             // its next RPC. The eviction safety hooks (forget / inval_entry)
@@ -663,6 +846,165 @@ pub fn raise_fd_limit() {
     }
 }
 
+/// Detect and lazily detach a dead FUSE mount left at `path` by a crashed
+/// predecessor. A healthy path stats fine; a dead FUSE mountpoint fails with
+/// ENOTCONN or EIO (the "corrupted mount" errnos k8s mount-utils also keys
+/// on). Detaching is safe for consumers: bind mounts made from this path
+/// reference the superblock directly and keep working.
+fn detach_dead_mount(path: &Path) {
+    let Err(e) = std::fs::metadata(path) else { return };
+    if !matches!(e.raw_os_error(), Some(libc::ENOTCONN) | Some(libc::EIO)) {
+        return;
+    }
+    // Both errnos can also come from a foreign filesystem at this path (a
+    // disconnected third-party FUSE mount, an NFS outage, a failing disk
+    // behind a bind mount) — MNT_DETACH would tear down a mount that isn't
+    // ours. Only detach when the mount table shows an hf-mount as the
+    // active (topmost) mount at exactly this path.
+    if !hf_mount_mounted_at(path) {
+        warn!(
+            "Mount point {:?} fails stat ({}) but the mount table shows no hf-mount there; leaving it alone",
+            path, e
+        );
+        return;
+    }
+    warn!(
+        "Dead mount detected at {:?} ({}); detaching it before mounting",
+        path, e
+    );
+    if !unmount_fuse(path) {
+        warn!("Failed to detach dead mount at {:?}; mount may fail", path);
+    }
+}
+
+/// Whether the mount table shows an hf-mount FUSE mount as the active mount
+/// at exactly `path`. Fail-closed: an unreadable mount table does not
+/// authorize a detach.
+#[cfg(target_os = "linux")]
+fn hf_mount_mounted_at(path: &Path) -> bool {
+    // Not read_to_string: a single non-UTF-8 mount path elsewhere in the
+    // table would fail the whole read. Lossy conversion keeps our (UTF-8)
+    // target comparable.
+    let Ok(mountinfo) = std::fs::read("/proc/self/mountinfo") else {
+        return false;
+    };
+    let Some(target) = resolve_mount_path(path) else {
+        return false;
+    };
+    mountinfo_has_hf_mount(&String::from_utf8_lossy(&mountinfo), &target)
+}
+
+/// Resolve the configured mount point to the path the kernel (and thus
+/// mountinfo) uses for it: trailing separators and `.` dropped, symlinks
+/// and `..` in the ancestors resolved through the filesystem — a lexical
+/// `..` collapse would name a different directory than the syscall when an
+/// ancestor is a symlink. The mount point itself stats with an error, so
+/// only its parent is canonicalized. `None` (fail closed) when the last
+/// component is not a plain name or the parent cannot be resolved.
+#[cfg(any(target_os = "linux", test))]
+fn resolve_mount_path(path: &Path) -> Option<PathBuf> {
+    let absolute: PathBuf = std::path::absolute(path).ok()?.components().collect();
+    let name = absolute.file_name()?;
+    let parent = std::fs::canonicalize(absolute.parent()?).ok()?;
+    Some(parent.join(name))
+}
+
+/// No mount table to consult off Linux: fail closed (the dead-mount recovery
+/// is a Kubernetes concern; macOS is a development platform).
+#[cfg(not(target_os = "linux"))]
+fn hf_mount_mounted_at(_path: &Path) -> bool {
+    false
+}
+
+/// Parse /proc/self/mountinfo content: is the active mount at exactly
+/// `target` (already resolved, see `resolve_mount_path`) an hf-mount FUSE
+/// mount? Mounts can be stacked on one path and `umount2` detaches the
+/// visible (topmost) one, so a foreign filesystem overmounted on a dead
+/// hf-mount must not get detached in its place. Line order is not stacking
+/// order (a moved mount keeps its position), so the topmost is found by
+/// topology: the entry at the path that no other entry at the path has as
+/// parent. Anything ambiguous fails closed. Direct mounts show as fstype
+/// "fuse" with source `FS_NAME` (fuser FSName); mountpod-mode mounts made
+/// by the CSI helper show as fstype `fuse.<FS_NAME>`.
+#[cfg(any(target_os = "linux", test))]
+fn mountinfo_has_hf_mount(mountinfo: &str, target: &Path) -> bool {
+    let target = target.to_string_lossy();
+    // Fields: ID PARENT major:minor root MOUNT-POINT options... - FSTYPE SOURCE super_opts
+    // (mount points octal-escape whitespace and backslash).
+    let at_target: Vec<(&str, &str, &str, &str)> = mountinfo
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ');
+            let (id, parent) = (fields.next()?, fields.next()?);
+            let mount_point = fields.nth(2)?;
+            let unescaped = mount_point
+                .replace("\\040", " ")
+                .replace("\\011", "\t")
+                .replace("\\012", "\n")
+                .replace("\\134", "\\");
+            if unescaped != target {
+                return None;
+            }
+            let mut after_separator = fields.skip_while(|field| *field != "-").skip(1);
+            Some((id, parent, after_separator.next()?, after_separator.next()?))
+        })
+        .collect();
+    let mut topmost = at_target
+        .iter()
+        .filter(|(id, ..)| !at_target.iter().any(|(_, parent, ..)| parent == id));
+    let (Some((_, _, fstype, source)), None) = (topmost.next(), topmost.next()) else {
+        return false;
+    };
+    fstype.strip_prefix("fuse.") == Some(FS_NAME) || (fstype.starts_with("fuse") && source == &FS_NAME)
+}
+
+/// Retry window for Hub calls made during mount startup, before the FUSE
+/// mount exists. Under a per-user 429 storm a single `send_with_retry` (2
+/// tries, RateLimit hint capped at 30s) can be outlasted by the storm;
+/// panicking here crash-loops the mount pod/sidecar and resets all startup
+/// progress. Keep retrying transient failures for up to this window instead,
+/// sleeping what the server asked for (`Error::retry_after`) when it said,
+/// so the startup retries don't feed the storm they are waiting out.
+const STARTUP_RETRY_DEADLINE: Duration = Duration::from_secs(300);
+
+async fn retry_startup<T, Fut>(what: &str, attempt: impl Fn() -> Fut) -> crate::error::Result<T>
+where
+    Fut: std::future::Future<Output = crate::error::Result<T>>,
+{
+    let start = std::time::Instant::now();
+    let mut attempt_no: u32 = 0;
+    loop {
+        // An attempt is itself several requests with internal retries; bound
+        // it too, or the last one can overrun the deadline by minutes.
+        let remaining = STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed());
+        let Ok(result) = tokio::time::timeout(remaining, attempt()).await else {
+            return Err(crate::error::Error::hub(format!(
+                "{what}: still failing after {STARTUP_RETRY_DEADLINE:?} of transient errors"
+            )));
+        };
+        let e = match result {
+            Ok(v) => return Ok(v),
+            Err(e) if !e.is_transient() => return Err(e),
+            Err(e) => e,
+        };
+        attempt_no += 1;
+        // Decide before sleeping so the deadline exit still carries the last
+        // Hub error (status, endpoint) instead of a synthetic message. The
+        // delay is never zero (t=0 hints parse as None), so this also covers
+        // an already-consumed deadline.
+        let delay = e
+            .retry_after()
+            .unwrap_or_else(|| crate::hub_api::retry_delay(attempt_no))
+            .min(crate::hub_api::MAX_RETRY_DELAY);
+        let remaining = STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed());
+        if delay >= remaining {
+            return Err(e);
+        }
+        warn!("{what}: transient startup failure ({e}); retrying in {delay:?} (deadline in {remaining:?})");
+        tokio::time::sleep(delay).await;
+    }
+}
+
 fn build_cas_config(
     ctx: &XetContext,
     runtime: &tokio::runtime::Handle,
@@ -687,7 +1029,7 @@ fn build_cas_config(
 
     let refresher = standard_refresher.expect("Standard client needs a standard token refresher");
     let jwt = runtime
-        .block_on(refresher.fetch_initial())
+        .block_on(retry_startup("storage token", || refresher.fetch_initial()))
         .unwrap_or_else(|e| panic!("Failed to get storage token: {e}"));
     info!("Got storage token for endpoint: {}", jwt.cas_url);
     Arc::new(
@@ -700,4 +1042,214 @@ fn build_cas_config(
         )
         .unwrap_or_else(|e| panic!("Failed to build TranslatorConfig: {e}")),
     )
+}
+
+/// Trigger FUSE unmount. Returns `true` on success. Uses libc as primary
+/// method (no external process dependency), then falls back to fusermount/umount.
+pub(crate) fn unmount_fuse(mount_point: &Path) -> bool {
+    use std::ffi::CString;
+
+    let c_path = CString::new(mount_point.to_string_lossy().as_bytes()).ok();
+
+    // Try libc unmount first.
+    if let Some(ref c_path) = c_path {
+        #[cfg(target_os = "linux")]
+        {
+            // MNT_DETACH: lazy unmount, detaches immediately.
+            if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
+                return true;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // MNT_FORCE: force unmount even with open files.
+            if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
+                return true;
+            }
+        }
+    }
+
+    // Fallback: external command. Try fusermount3 first (FUSE3), then fusermount.
+    #[cfg(target_os = "linux")]
+    let cmd_ok = Command::new("fusermount3")
+        .args(["-u", "-z", &mount_point.to_string_lossy()])
+        .status()
+        .is_ok_and(|s| s.success())
+        || Command::new("fusermount")
+            .args(["-u", "-z", &mount_point.to_string_lossy()])
+            .status()
+            .is_ok_and(|s| s.success());
+    #[cfg(target_os = "macos")]
+    let cmd_ok = Command::new("umount")
+        .arg(mount_point)
+        .status()
+        .is_ok_and(|s| s.success());
+
+    if !cmd_ok {
+        warn!("Failed to unmount {:?}", mount_point);
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        XET_UPLOAD_CONCURRENCY_CAP, defers_to_fixed_concurrency, mountinfo_has_hf_mount, parse_mode, validate_revision,
+        xet_env_defaults,
+    };
+    use std::path::Path;
+    use xet_runtime::config::XetConfig;
+
+    #[test]
+    fn mountinfo_matches_hf_mount_mounts_only() {
+        let mountinfo = "\
+36 25 0:31 / /data/nfs rw,relatime shared:1 - nfs4 10.0.0.1:/export rw,addr=10.0.0.1
+37 25 0:32 / /mnt/hf rw,nosuid,nodev shared:2 - fuse hf-mount rw,user_id=0,group_id=0
+38 25 0:33 / /mnt/pod rw,nosuid shared:4 - fuse.hf-mount hf-mount rw,user_id=0
+39 25 0:35 / /mnt/other rw,relatime - fuse.sshfs user@host:/ rw
+40 25 8:1 / /mnt/disk rw,relatime shared:3 - ext4 /dev/sda1 rw
+41 25 0:34 / /mnt/with\\040space rw - fuse hf-mount rw
+43 42 0:37 / /mnt/stacked rw shared:6 - nfs4 10.0.0.2:/export rw
+42 25 0:36 / /mnt/stacked rw shared:5 - fuse.hf-mount hf-mount rw
+44 25 0:38 / /mnt/covered rw shared:7 - nfs4 10.0.0.3:/export rw
+45 44 0:39 / /mnt/covered rw shared:8 - fuse hf-mount rw
+";
+        // Direct mount (fuser FSName) and mountpod mount (CSI helper subtype).
+        assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/hf")));
+        assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/pod")));
+        assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/with space")));
+        // A foreign FUSE filesystem is not ours.
+        assert!(!mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/other")));
+        // Non-FUSE filesystems and non-mountpoints must not match.
+        assert!(!mountinfo_has_hf_mount(mountinfo, Path::new("/data/nfs")));
+        assert!(!mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/disk")));
+        assert!(!mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/nothing")));
+        // Exact match only — a parent of a mount is not itself one.
+        assert!(!mountinfo_has_hf_mount(mountinfo, Path::new("/mnt")));
+        // A foreign filesystem overmounted on a dead hf-mount is the active
+        // mount: umount2 would detach it, so it must not qualify — even when
+        // it is listed before the hf-mount it covers (topology, not order).
+        assert!(!mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/stacked")));
+        // The reverse stack (hf-mount over a foreign mount) is ours to detach.
+        assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/covered")));
+    }
+
+    #[test]
+    fn resolve_mount_path_follows_ancestor_symlinks_like_the_kernel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("b/c")).unwrap();
+        std::os::unix::fs::symlink(root.join("b/c"), root.join("link")).unwrap();
+
+        // `link/..` is b (through the symlink), not the tmp root as a lexical
+        // collapse would say — the kernel resolves it the same way.
+        assert_eq!(
+            super::resolve_mount_path(&root.join("link/../hf")),
+            Some(root.join("b/hf"))
+        );
+        // Trailing separators and `.` are dropped; the leaf need not exist.
+        assert_eq!(
+            super::resolve_mount_path(&root.join("b/./hf/")),
+            Some(root.join("b/hf"))
+        );
+        // A leaf that is not a plain name, or an unresolvable parent, fails closed.
+        assert_eq!(super::resolve_mount_path(&root.join("b/..")), None);
+        assert_eq!(super::resolve_mount_path(&root.join("missing/hf")), None);
+    }
+
+    #[test]
+    fn parse_mode_accepts_octal_forms() {
+        assert_eq!(parse_mode("0755").unwrap(), 0o755);
+        assert_eq!(parse_mode("777").unwrap(), 0o777);
+        assert_eq!(parse_mode("0o666").unwrap(), 0o666);
+        assert_eq!(parse_mode("1777").unwrap(), 0o1777);
+    }
+
+    #[test]
+    fn parse_mode_rejects_invalid() {
+        for bad in ["", "8", "0x1ff", "rwx", "10000"] {
+            assert!(parse_mode(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_plain_refs_and_shas() {
+        for ok in [
+            "main",
+            "v1.0.0",
+            "feature/foo",
+            "refs/heads/dev",
+            "0123456789abcdef0123456789abcdef01234567",
+        ] {
+            assert!(validate_revision(ok).is_ok(), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_query_smuggling() {
+        assert!(validate_revision("main?; /usr/bin/id > /tmp/x").is_err());
+    }
+
+    #[test]
+    fn rejects_shell_and_url_metacharacters() {
+        for bad in [
+            "a?b", "a#b", "a;b", "a b", "a|b", "a&b", "a`b`", "a$b", "a>b", "a\\b", "",
+        ] {
+            assert!(validate_revision(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_chars_outside_allowlist_and_dot_dot() {
+        for bad in ["a@b", "a:b", "a~b", "a^b", "a%b", "a+b", "main/../etc"] {
+            assert!(validate_revision(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    /// Each default must parse as its `HF_XET_<GROUP>_<FIELD>` setting: xet-core
+    /// ignores a value it cannot parse and a setting it no longer knows.
+    #[test]
+    fn xet_env_defaults_are_accepted_by_xet_core() {
+        let upload_cap = XET_UPLOAD_CONCURRENCY_CAP.to_string();
+        let rejected: Vec<String> = xet_env_defaults(&upload_cap)
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let (group, field) = key
+                    .strip_prefix("HF_XET_")
+                    .and_then(|rest| rest.split_once('_'))
+                    .unwrap_or_else(|| panic!("{key} is not HF_XET_<GROUP>_<FIELD>"));
+                let path = format!("{}.{}", group.to_lowercase(), field.to_lowercase());
+                let result = XetConfig::default().with_config(&path, value);
+                result.err().map(|err| format!("{key}={value}: {err}"))
+            })
+            .collect();
+        assert!(rejected.is_empty(), "rejected by xet-core: {rejected:#?}");
+    }
+
+    /// A fixed download (or upload) concurrency set by the user keeps the
+    /// adaptive defaults of that direction unset, and only of that direction.
+    #[test]
+    fn fixed_concurrency_keeps_its_direction_defaults_unset() {
+        let upload_cap = XET_UPLOAD_CONCURRENCY_CAP.to_string();
+        for fixed in ["HF_XET_FIXED_DOWNLOAD_CONCURRENCY", "HF_XET_FIXED_UPLOAD_CONCURRENCY"] {
+            let direction = if fixed.contains("DOWNLOAD") {
+                "DOWNLOAD"
+            } else {
+                "UPLOAD"
+            };
+            for (key, _) in xet_env_defaults(&upload_cap) {
+                let deferred = defers_to_fixed_concurrency(key, |name| name == fixed);
+                assert_eq!(
+                    deferred,
+                    key.contains(&format!("{direction}_CONCURRENCY")),
+                    "{fixed} and {key}"
+                );
+            }
+        }
+        assert!(!defers_to_fixed_concurrency(
+            "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY",
+            |_| false
+        ));
+    }
 }

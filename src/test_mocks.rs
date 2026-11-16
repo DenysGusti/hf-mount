@@ -1,6 +1,6 @@
 //! Mock implementations for unit testing VirtualFs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,6 +10,7 @@ use bytes::Bytes;
 use xet_data::processing::XetFileInfo;
 
 use crate::error::{Error, Result};
+use crate::follow::{FollowEvent, FollowStreamOps};
 use crate::hub_api::{BatchOp, HeadFileInfo, HubOps, SourceKind, TreeEntry};
 use crate::overlay::OverlayBacking;
 use crate::xet::{DownloadStreamOps, StagingDir, StreamingWriterOps, XetOps};
@@ -22,6 +23,10 @@ pub struct MockHub {
     pub batch_log: Mutex<Vec<Vec<BatchOp>>>,
     batch_fail_count: AtomicU32,
     batch_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// HTTP status for the next list_tree failure.
+    list_tree_fail_status: Mutex<Option<u16>>,
+    /// HTTP status for the next head_file failure (used with head_fail).
+    head_fail_status: Mutex<Option<u16>>,
     head_fail: AtomicBool,
     download_fail: AtomicBool,
     source: SourceKind,
@@ -32,49 +37,58 @@ pub struct MockHub {
     /// `Ok(rev)` returns the token; `Err((status, msg))` rebuilds an
     /// `Error::Hub` with that status so the poll loop's 401-branch still fires.
     revision: Mutex<std::result::Result<String, (Option<u16>, String)>>,
+    /// When false (default), follow_events reports the feed as absent so
+    /// callers exercise the poll fallback.
+    follow_enabled: AtomicBool,
+    /// Scripted items served (in order) by every mock follow stream: an
+    /// event, or `None` to end the current stream like a TCP close. When the
+    /// script runs dry the stream waits for more items to be pushed — like a
+    /// healthy but quiet SSE connection.
+    follow_script: Arc<Mutex<VecDeque<Option<FollowEvent>>>>,
+    /// Statuses the next follow_events connects fail with, one per connect
+    /// (in order); an empty queue means connects succeed.
+    follow_connect_failures: Mutex<VecDeque<u16>>,
+    /// `(cursor, since)` of every follow_events connect, in order.
+    follow_connects: Mutex<Vec<(Option<String>, Option<String>)>>,
 }
 
 #[allow(dead_code)]
 impl MockHub {
-    pub fn new() -> Arc<Self> {
+    fn with_source(source: SourceKind) -> Arc<Self> {
         Arc::new(Self {
             tree: Mutex::new(Vec::new()),
             head_responses: Mutex::new(HashMap::new()),
             batch_log: Mutex::new(Vec::new()),
             batch_fail_count: AtomicU32::new(0),
             batch_barrier: Mutex::new(None),
+            list_tree_fail_status: Mutex::new(None),
+            head_fail_status: Mutex::new(None),
             head_fail: AtomicBool::new(false),
             download_fail: AtomicBool::new(false),
-            source: SourceKind::Bucket {
-                bucket_id: "test-bucket".to_string(),
-            },
+            source,
             default_mtime: UNIX_EPOCH,
             list_tree_calls: AtomicU32::new(0),
             head_file_calls: AtomicU32::new(0),
             probe_revision_calls: AtomicU32::new(0),
             revision: Mutex::new(Ok("rev-0".to_string())),
+            follow_enabled: AtomicBool::new(false),
+            follow_script: Arc::new(Mutex::new(VecDeque::new())),
+            follow_connect_failures: Mutex::new(VecDeque::new()),
+            follow_connects: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn new() -> Arc<Self> {
+        Self::with_source(SourceKind::Bucket {
+            bucket_id: "test-bucket".to_string(),
         })
     }
 
     pub fn new_repo() -> Arc<Self> {
-        Arc::new(Self {
-            tree: Mutex::new(Vec::new()),
-            head_responses: Mutex::new(HashMap::new()),
-            batch_log: Mutex::new(Vec::new()),
-            batch_fail_count: AtomicU32::new(0),
-            batch_barrier: Mutex::new(None),
-            head_fail: AtomicBool::new(false),
-            download_fail: AtomicBool::new(false),
-            source: SourceKind::Repo {
-                repo_id: "test/repo".to_string(),
-                repo_type: crate::hub_api::RepoType::Model,
-                revision: "main".to_string(),
-            },
-            default_mtime: UNIX_EPOCH,
-            list_tree_calls: AtomicU32::new(0),
-            head_file_calls: AtomicU32::new(0),
-            probe_revision_calls: AtomicU32::new(0),
-            revision: Mutex::new(Ok("rev-0".to_string())),
+        Self::with_source(SourceKind::Repo {
+            repo_id: "test/repo".to_string(),
+            repo_type: crate::hub_api::RepoType::Model,
+            revision: "main".to_string(),
         })
     }
 
@@ -128,6 +142,19 @@ impl MockHub {
         self.head_fail.store(true, Ordering::SeqCst);
     }
 
+    /// Make the next head_file call fail with the given HTTP status (e.g.
+    /// 429 to simulate rate limiting after client-side retries).
+    pub fn fail_next_head_with_status(&self, status: u16) {
+        *self.head_fail_status.lock().unwrap() = Some(status);
+        self.head_fail.store(true, Ordering::SeqCst);
+    }
+
+    /// Make the next list_tree call fail with the given HTTP status (e.g.
+    /// 429 to simulate rate limiting after client-side retries).
+    pub fn fail_next_list_tree_with_status(&self, status: u16) {
+        *self.list_tree_fail_status.lock().unwrap() = Some(status);
+    }
+
     pub fn list_tree_call_count(&self) -> u32 {
         self.list_tree_calls.load(Ordering::SeqCst)
     }
@@ -159,12 +186,50 @@ impl MockHub {
     pub fn take_batch_log(&self) -> Vec<Vec<BatchOp>> {
         std::mem::take(&mut *self.batch_log.lock().unwrap())
     }
+
+    /// Serve the live-follow feed (default: absent → poll fallback).
+    pub fn enable_follow(&self) {
+        self.follow_enabled.store(true, Ordering::SeqCst);
+    }
+
+    /// Append an event to the follow-stream script.
+    pub fn push_follow(&self, event: FollowEvent) {
+        self.follow_script.lock().unwrap().push_back(Some(event));
+    }
+
+    /// End the current follow stream without a server-directed reconnect
+    /// (`Ok(None)`, like a TCP close) once the script reaches this point.
+    pub fn end_follow_stream(&self) {
+        self.follow_script.lock().unwrap().push_back(None);
+    }
+
+    /// Fail the next follow_events connect with this status (queued, in
+    /// order, one per connect).
+    pub fn fail_next_follow_connect(&self, status: u16) {
+        self.follow_connect_failures.lock().unwrap().push_back(status);
+    }
+
+    /// `(cursor, since)` of every follow_events connect so far.
+    pub fn follow_connect_log(&self) -> Vec<(Option<String>, Option<String>)> {
+        self.follow_connects.lock().unwrap().clone()
+    }
+}
+
+/// Build a mock Hub error, carrying `status` when one is configured.
+fn mock_error(status: Option<u16>, msg: &str) -> Error {
+    match status {
+        Some(status) => Error::hub_status(status, msg),
+        None => Error::hub(msg),
+    }
 }
 
 #[async_trait::async_trait]
 impl HubOps for MockHub {
     async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         self.list_tree_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(status) = self.list_tree_fail_status.lock().unwrap().take() {
+            return Err(Error::hub_status(status, "mock list_tree failure"));
+        }
         let tree = self.tree.lock().unwrap();
         let prefix_slash = if prefix.is_empty() {
             String::new()
@@ -172,8 +237,11 @@ impl HubOps for MockHub {
             format!("{}/", prefix)
         };
 
-        // Non-recursive: return direct children only, synthesizing directory entries
-        // for intermediate paths (mirrors real Hub API behavior).
+        // Non-recursive: return direct children only, synthesizing directory
+        // entries for intermediate paths. Strict descendants only — the raw
+        // S3 key-prefix matches of the bucket tree API are filtered out by
+        // `HubApiClient::list_tree` before reaching consumers, so the mock
+        // honors the same contract.
         let mut result = Vec::new();
         let mut seen_dirs = std::collections::HashSet::new();
         for entry in tree.iter() {
@@ -211,7 +279,8 @@ impl HubOps for MockHub {
     async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
         self.head_file_calls.fetch_add(1, Ordering::SeqCst);
         if self.head_fail.swap(false, Ordering::SeqCst) {
-            return Err(Error::hub("mock head_file failure"));
+            let status = self.head_fail_status.lock().unwrap().take();
+            return Err(mock_error(status, "mock head_file failure"));
         }
         let responses = self.head_responses.lock().unwrap();
         match responses.get(path) {
@@ -269,8 +338,48 @@ impl HubOps for MockHub {
         self.probe_revision_calls.fetch_add(1, Ordering::SeqCst);
         match &*self.revision.lock().unwrap() {
             Ok(s) => Ok(s.clone()),
-            Err((Some(status), msg)) => Err(Error::hub_status(*status, msg.clone())),
-            Err((None, msg)) => Err(Error::hub(msg.clone())),
+            Err((status, msg)) => Err(mock_error(*status, msg)),
+        }
+    }
+
+    async fn follow_events(
+        &self,
+        cursor: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Option<Box<dyn FollowStreamOps>>> {
+        if !self.follow_enabled.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        self.follow_connects
+            .lock()
+            .unwrap()
+            .push((cursor.map(str::to_string), since.map(str::to_string)));
+        if let Some(status) = self.follow_connect_failures.lock().unwrap().pop_front() {
+            return Err(mock_error(Some(status), "mock: follow connect refused"));
+        }
+        Ok(Some(Box::new(MockFollowStream {
+            script: self.follow_script.clone(),
+        })))
+    }
+}
+
+/// Follow stream serving [`MockHub`]'s shared script. An empty script means
+/// "healthy but quiet": the stream polls for new events instead of ending, so
+/// tests can drive it incrementally.
+struct MockFollowStream {
+    script: Arc<Mutex<VecDeque<Option<FollowEvent>>>>,
+}
+
+#[async_trait::async_trait]
+impl FollowStreamOps for MockFollowStream {
+    async fn next_event(&mut self) -> Result<Option<FollowEvent>> {
+        loop {
+            let item = self.script.lock().unwrap().pop_front();
+            match item {
+                Some(Some(event)) => return Ok(Some(event)),
+                Some(None) => return Ok(None),
+                None => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
         }
     }
 }
@@ -278,7 +387,7 @@ impl HubOps for MockHub {
 // ── MockXet ───────────────────────────────────────────────────────────
 
 pub struct MockXet {
-    files: Mutex<HashMap<String, Vec<u8>>>,
+    files: Mutex<HashMap<String, Bytes>>,
     pub next_hash: AtomicU64,
     writer_create_fail: AtomicBool,
     upload_fail: AtomicBool,
@@ -291,8 +400,21 @@ pub struct MockXet {
     /// When true, opened streams hang on `next()` (simulates a stalled CAS/CDN
     /// connection) so the read-fetch timeout path can be exercised.
     stall_stream: AtomicBool,
-    /// Log of (offset, end) pairs passed to download_stream_boxed.
-    pub stream_calls: Mutex<Vec<(u64, Option<u64>)>>,
+    /// Log of (offset, end, cached) passed to download_stream_boxed.
+    pub stream_calls: Mutex<Vec<(u64, u64, bool)>>,
+    /// Delay before an opened stream yields its first chunk (CAS latency).
+    stream_delay: Mutex<Option<Duration>>,
+    /// A stream whose range covers this offset waits this long instead.
+    slow_offset: Mutex<Option<(u64, Duration)>>,
+    /// A stream whose range covers this offset fails to open.
+    fail_offset: Mutex<Option<u64>>,
+    /// Every opened stream fails after delivering this many bytes.
+    stream_fail_after: Mutex<Option<usize>>,
+    /// A link of this many bytes per second, delivering chunks of the given
+    /// size (whole xet terms), and when it has downloaded all the chunks of
+    /// the streams opened so far.
+    link: Mutex<Option<(u64, usize)>>,
+    link_free_at: Mutex<Option<tokio::time::Instant>>,
     /// Count of download_to_file calls (used to assert staging cache reuse).
     pub download_to_file_calls: AtomicU64,
     /// Test hook to pause `upload_files` mid-call so the test can drive
@@ -322,6 +444,12 @@ impl MockXet {
             range_empty_count: AtomicU32::new(0),
             stall_stream: AtomicBool::new(false),
             stream_calls: Mutex::new(Vec::new()),
+            stream_delay: Mutex::new(None),
+            slow_offset: Mutex::new(None),
+            fail_offset: Mutex::new(None),
+            stream_fail_after: Mutex::new(None),
+            link: Mutex::new(None),
+            link_free_at: Mutex::new(None),
             download_to_file_calls: AtomicU64::new(0),
             upload_gate: Mutex::new(None),
             uploads_inflight: AtomicU32::new(0),
@@ -341,7 +469,10 @@ impl MockXet {
     }
 
     pub fn add_file(&self, hash: &str, content: &[u8]) {
-        self.files.lock().unwrap().insert(hash.to_string(), content.to_vec());
+        self.files
+            .lock()
+            .unwrap()
+            .insert(hash.to_string(), Bytes::copy_from_slice(content));
     }
 
     pub fn fail_next_writer_create(&self) {
@@ -370,6 +501,36 @@ impl MockXet {
     /// connection that neither delivers data nor errors.
     pub fn stall_stream_reads(&self) {
         self.stall_stream.store(true, Ordering::SeqCst);
+    }
+
+    /// Make every opened stream wait `delay` before its first chunk.
+    pub fn set_stream_delay(&self, delay: Duration) {
+        *self.stream_delay.lock().unwrap() = Some(delay);
+    }
+
+    /// Make the streams whose range covers `offset` wait `delay` before
+    /// their first chunk.
+    pub fn set_slow_offset(&self, offset: u64, delay: Duration) {
+        *self.slow_offset.lock().unwrap() = Some((offset, delay));
+    }
+
+    /// Make the streams whose range covers `offset` fail to open.
+    pub fn set_fail_offset(&self, offset: u64) {
+        *self.fail_offset.lock().unwrap() = Some(offset);
+    }
+
+    /// Make every opened stream fail after delivering `bytes`.
+    pub fn fail_streams_after(&self, bytes: usize) {
+        *self.stream_fail_after.lock().unwrap() = Some(bytes);
+    }
+
+    /// Serve streams over a link of `rate` bytes per second, in chunks of
+    /// `chunk` bytes, as xet does: a stream asks for all its chunks (terms)
+    /// when it opens, the link downloads the chunks of all streams in the
+    /// order they were asked for, and a chunk is delivered once downloaded.
+    /// A stream dropped early leaves its chunks downloading.
+    pub fn set_link(&self, rate: u64, chunk: usize) {
+        *self.link.lock().unwrap() = Some((rate, chunk));
     }
 
     fn next_hash_string(&self) -> String {
@@ -425,7 +586,7 @@ impl XetOps for MockXet {
             let content = std::fs::read(path).map_err(Error::Io)?;
             let hash = self.next_hash_string();
             let size = content.len() as u64;
-            self.files.lock().unwrap().insert(hash.clone(), content);
+            self.files.lock().unwrap().insert(hash.clone(), Bytes::from(content));
             results.push(XetFileInfo::new(hash, size));
         }
         Ok(results)
@@ -441,12 +602,19 @@ impl XetOps for MockXet {
         &self,
         file_info: &XetFileInfo,
         offset: u64,
-        end: Option<u64>,
+        end: u64,
+        cached: bool,
     ) -> Result<Box<dyn DownloadStreamOps>> {
-        self.stream_calls.lock().unwrap().push((offset, end));
+        self.stream_calls.lock().unwrap().push((offset, end, cached));
 
         if self.stall_stream.load(Ordering::SeqCst) {
             return Ok(Box::new(StallingDownloadStream));
+        }
+        if let Some(at) = *self.fail_offset.lock().unwrap()
+            && offset <= at
+            && at < end
+        {
+            return Err(Error::Xet("mock stream open failure at offset".into()));
         }
 
         let prev_fail = self.range_fail_count.load(Ordering::SeqCst);
@@ -458,20 +626,42 @@ impl XetOps for MockXet {
         if prev_empty > 0 {
             self.range_empty_count.fetch_sub(1, Ordering::SeqCst);
             return Ok(Box::new(MockDownloadStream {
-                data: Vec::new(),
+                data: Bytes::new(),
                 offset: 0,
                 end: 0,
                 chunk_size: 4096,
+                delay: None,
+                fail_after: None,
+                arrivals: VecDeque::new(),
             }));
         }
         let files = self.files.lock().unwrap();
         let content = files.get(file_info.hash()).cloned().unwrap_or_default();
-        let bounded_end = end.map(|e| e as usize).unwrap_or(content.len());
+        let link = *self.link.lock().unwrap();
+        let mut arrivals = VecDeque::new();
+        if let Some((rate, chunk)) = link {
+            let mut free_at = self.link_free_at.lock().unwrap();
+            let mut at = free_at.map_or(tokio::time::Instant::now(), |free| {
+                free.max(tokio::time::Instant::now())
+            });
+            for start in (offset..end.min(content.len() as u64)).step_by(chunk) {
+                let len = (end.min(content.len() as u64) - start).min(chunk as u64);
+                at += Duration::from_secs_f64(len as f64 / rate as f64);
+                arrivals.push_back(at);
+            }
+            *free_at = Some(at);
+        }
         Ok(Box::new(MockDownloadStream {
             data: content,
             offset: offset as usize,
-            end: bounded_end,
-            chunk_size: 4096,
+            end: end as usize,
+            chunk_size: link.map_or(4096, |(_, chunk)| chunk),
+            delay: match *self.slow_offset.lock().unwrap() {
+                Some((at, delay)) if offset <= at && at < end => Some(delay),
+                _ => *self.stream_delay.lock().unwrap(),
+            },
+            fail_after: *self.stream_fail_after.lock().unwrap(),
+            arrivals,
         }))
     }
 }
@@ -511,21 +701,40 @@ impl StreamingWriterOps for MockStreamingWriter {
 // ── MockDownloadStream ────────────────────────────────────────────────
 
 pub struct MockDownloadStream {
-    data: Vec<u8>,
+    data: Bytes,
     offset: usize,
     /// Upper bound (exclusive) on data this stream will serve.
     end: usize,
     chunk_size: usize,
+    /// Wait before the first chunk.
+    delay: Option<Duration>,
+    /// Bytes left to deliver before the stream fails.
+    fail_after: Option<usize>,
+    /// When the link delivers each chunk left, over a mock link.
+    arrivals: VecDeque<tokio::time::Instant>,
 }
 
 #[async_trait::async_trait]
 impl DownloadStreamOps for MockDownloadStream {
     async fn next(&mut self) -> Result<Option<Bytes>> {
+        if let Some(delay) = self.delay.take() {
+            tokio::time::sleep(delay).await;
+        }
         if self.offset >= self.end.min(self.data.len()) {
             return Ok(None);
         }
-        let chunk_end = (self.offset + self.chunk_size).min(self.end).min(self.data.len());
-        let chunk = Bytes::copy_from_slice(&self.data[self.offset..chunk_end]);
+        if self.fail_after == Some(0) {
+            return Err(Error::Xet("mock stream failure mid-stream".into()));
+        }
+        let mut chunk_end = (self.offset + self.chunk_size).min(self.end).min(self.data.len());
+        if let Some(left) = self.fail_after {
+            chunk_end = chunk_end.min(self.offset + left);
+            self.fail_after = Some(left - (chunk_end - self.offset));
+        }
+        if let Some(at) = self.arrivals.pop_front() {
+            tokio::time::sleep_until(at).await;
+        }
+        let chunk = self.data.slice(self.offset..chunk_end);
         self.offset = chunk_end;
         Ok(Some(chunk))
     }
@@ -533,7 +742,8 @@ impl DownloadStreamOps for MockDownloadStream {
 
 /// A stream whose `next()` never resolves, modelling a CAS/CDN connection that
 /// stalls without delivering data or erroring. Used to exercise the read-fetch
-/// timeout: without a bound, awaiting this parks the FUSE worker thread forever.
+/// timeout: without a bound, the fetch and the reads that wait for its blocks
+/// would hang forever.
 pub struct StallingDownloadStream;
 
 #[async_trait::async_trait]
@@ -552,9 +762,12 @@ pub struct TestOpts {
     pub overlay: bool,
     pub serve_lookup_from_cache: bool,
     pub metadata_ttl: Duration,
+    pub negative_ttl: Duration,
     pub inode_soft_limit: usize,
     pub max_staging_size: u64,
     pub read_fetch_timeout: Duration,
+    pub dir_mode: u16,
+    pub file_mode: u16,
 }
 
 impl Default for TestOpts {
@@ -565,9 +778,12 @@ impl Default for TestOpts {
             overlay: false,
             serve_lookup_from_cache: false,
             metadata_ttl: Duration::from_secs(1),
+            negative_ttl: Duration::from_secs(1),
             inode_soft_limit: 0,
             max_staging_size: 0,
             read_fetch_timeout: Duration::from_secs(30),
+            dir_mode: 0o755,
+            file_mode: 0o644,
         }
     }
 }
@@ -641,16 +857,22 @@ pub fn make_test_vfs(
             advanced_writes: opts.advanced_writes,
             uid: 1000,
             gid: 1000,
+            dir_mode: opts.dir_mode,
+            file_mode: opts.file_mode,
             poll_interval_secs: 0,
             poll_listing_concurrency: 4,
+            live_follow: false,
             metadata_ttl: opts.metadata_ttl,
+            negative_ttl: opts.negative_ttl,
             serve_lookup_from_cache: opts.serve_lookup_from_cache,
             filter_os_files: true,
             direct_io: false,
             flush_debounce: Duration::from_millis(100),
             flush_max_batch_window: Duration::from_secs(1),
+            flush_interval: Duration::ZERO,
             flush_shutdown_timeout: Duration::from_secs(5),
             read_fetch_timeout: opts.read_fetch_timeout,
+            read_ahead_bytes: 1 << 30,
             inode_soft_limit: opts.inode_soft_limit,
             lru_sweep_interval: Duration::from_millis(50),
         },
@@ -686,16 +908,22 @@ pub fn make_overlay_test_vfs_with_root(
             advanced_writes: false,
             uid: 1000,
             gid: 1000,
+            dir_mode: 0o755,
+            file_mode: 0o644,
             poll_interval_secs: 0,
             poll_listing_concurrency: 4,
+            live_follow: false,
             metadata_ttl: Duration::from_secs(1),
+            negative_ttl: Duration::from_secs(1),
             serve_lookup_from_cache: false,
             filter_os_files: true,
             direct_io: false,
             flush_debounce: Duration::from_millis(100),
             flush_max_batch_window: Duration::from_secs(1),
+            flush_interval: Duration::ZERO,
             flush_shutdown_timeout: Duration::from_secs(5),
             read_fetch_timeout: Duration::from_secs(30),
+            read_ahead_bytes: 1 << 30,
             inode_soft_limit: 0,
             lru_sweep_interval: Duration::from_secs(5),
         },
