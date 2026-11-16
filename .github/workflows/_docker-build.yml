@@ -49,17 +49,19 @@ jobs:
       - name: Compute the apt cache key (ISO week)
         id: apt_refresh
         run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
-      # Native amd64 runner, so the image loads locally and the scan gates the push.
-      - uses: huggingface/wiz-image-action/build-push@53a5b4af184193adf1773753f29b3f903445e31b # v1.3.0
+      # [IIASA] Plain build-push instead of upstream's Wiz scan action (needs
+      # Hugging Face's WIZ_CLI_* credentials, which this fork does not have).
+      - uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
-          image: ${{ env.IMAGE }}:${{ inputs.tag_base }}-amd64
           context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ inputs.tag_base }}-amd64
+          provenance: false
           build-args: |
             APT_REFRESH=${{ steps.apt_refresh.outputs.week }}
           cache-to: type=registry,ref=${{ env.IMAGE }}-cache:amd64,mode=max
           cache-from: type=registry,ref=${{ env.IMAGE }}-cache:amd64
-          clientId: ${{ vars.WIZ_CLI_CLIENT_ID }}
-          clientSecret: ${{ secrets.WIZ_CLI_CLIENT_SECRET }}
 
   arm64:
     permissions:
@@ -82,17 +84,18 @@ jobs:
       - name: Compute the apt cache key (ISO week)
         id: apt_refresh
         run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
-      # Native arm64 runner, so the image loads locally and the scan gates the push.
-      - uses: huggingface/wiz-image-action/build-push@53a5b4af184193adf1773753f29b3f903445e31b # v1.3.0
+      # [IIASA] Plain build-push instead of upstream's Wiz scan action (see amd64).
+      - uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
-          image: ${{ env.IMAGE }}:${{ inputs.tag_base }}-arm64
           context: .
+          platforms: linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ inputs.tag_base }}-arm64
+          provenance: false
           build-args: |
             APT_REFRESH=${{ steps.apt_refresh.outputs.week }}
           cache-to: type=registry,ref=${{ env.IMAGE }}-cache:arm64,mode=max
           cache-from: type=registry,ref=${{ env.IMAGE }}-cache:arm64
-          clientId: ${{ vars.WIZ_CLI_CLIENT_ID }}
-          clientSecret: ${{ secrets.WIZ_CLI_CLIENT_SECRET }}
 
   manifest:
     permissions:
