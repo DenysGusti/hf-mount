@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_atime, set_gid3,
+    fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_atime, set_gid3,
     set_mode3, set_mtime, set_size3, set_uid3, specdata3,
 };
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -22,6 +22,12 @@ pub struct NFSAdapter {
     virtual_fs: Arc<VirtualFs>,
     handle_pool: Arc<Mutex<HandlePool>>,
     read_only: bool,
+    /// Server start time in ms, stamped in every file handle.
+    generation: u64,
+    /// Put the file's path in its handles, so a handle of an earlier server
+    /// still resolves. Only the Windows client reuses handles across a
+    /// remount; elsewhere each mount is a new server on a new port.
+    path_handles: bool,
 }
 
 impl NFSAdapter {
@@ -30,6 +36,10 @@ impl NFSAdapter {
             virtual_fs,
             handle_pool: Arc::new(Mutex::new(HandlePool::new())),
             read_only,
+            generation: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(1, |elapsed| elapsed.as_millis() as u64),
+            path_handles: cfg!(windows),
         }
     }
 
@@ -137,6 +147,44 @@ impl NFSAdapter {
 impl NFSFileSystem for NFSAdapter {
     fn root_dir(&self) -> fileid3 {
         1
+    }
+
+    /// A handle is the generation, the inode number and, with `path_handles`
+    /// and when it fits in the 64-byte NFSv3 limit, the file's path. Inode
+    /// numbers change when the server restarts, so a handle of an earlier
+    /// server is resolved again by its path (a new file at that path takes
+    /// it over), and is stale when the path did not fit or is gone.
+    fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
+        let mut data = Vec::with_capacity(nfsserve::nfs::NFS3_FHSIZE as usize);
+        data.extend_from_slice(&self.generation.to_le_bytes());
+        data.extend_from_slice(&id.to_le_bytes());
+        if self.path_handles
+            && let Some(path) = self.virtual_fs.full_path(id)
+            && data.len() + path.len() <= nfsserve::nfs::NFS3_FHSIZE as usize
+        {
+            data.extend_from_slice(path.as_bytes());
+        }
+        nfs_fh3 { data }
+    }
+
+    fn fh_to_id(&self, fh: &nfs_fh3) -> Result<fileid3, nfsstat3> {
+        let Some((generation, rest)) = fh.data.split_first_chunk() else {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        };
+        let Some((id, path)) = rest.split_first_chunk() else {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        };
+        let (generation, id) = (u64::from_le_bytes(*generation), u64::from_le_bytes(*id));
+        if generation == self.generation || id == self.root_dir() {
+            return Ok(id);
+        }
+        // An empty path is a handle whose path did not fit, not the root.
+        if path.is_empty() {
+            return Err(nfsstat3::NFS3ERR_STALE);
+        }
+        // fh_to_id is synchronous; resolving may list directories on the Hub.
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(|| runtime.block_on(self.path_to_id(path))).map_err(|_| nfsstat3::NFS3ERR_STALE)
     }
 
     fn capabilities(&self) -> VFSCapabilities {
@@ -524,9 +572,29 @@ pub async fn mount_nfs(
         });
     }));
 
-    let mut listener = NFSTcpListener::bind("127.0.0.1:0", adapter).await?;
+    // Windows mount.exe always asks the portmapper on port 111, so each
+    // mount needs a loopback address of its own. Derive it from the mount
+    // point so a remount reaches the same address: the Windows client keeps
+    // trying the servers it knew, and a new address per start leaves it
+    // retrying dead ones, which blocks every later mount.
+    #[cfg(windows)]
+    let host = {
+        // FNV-1a: stable across Rust versions, unlike DefaultHasher.
+        let hash = mount_point
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .bytes()
+            .fold(0x811c_9dc5_u32, |hash, byte| {
+                (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+            });
+        let [b, c, d, _] = hash.to_le_bytes();
+        format!("127.{b}.{c}.{}", d.max(2))
+    };
+    #[cfg(not(windows))]
+    let host = "127.0.0.1".to_string();
+    let mut listener = NFSTcpListener::bind(&format!("{host}:0"), adapter).await?;
     let port = listener.get_listen_port();
-    info!("NFS server listening on 127.0.0.1:{}", port);
+    info!("NFS server listening on {host}:{port}");
 
     // Register mount/unmount listener: nfsserve sends `false` on UMNT.
     let (mount_tx, mut mount_rx) = tokio::sync::mpsc::channel::<bool>(1);
@@ -621,6 +689,56 @@ pub async fn mount_nfs(
         }
     }
 
+    // Windows NFS client (Services for NFS / Client for NFS feature).
+    // The mount point must be a drive letter (e.g. "Z:") or an empty NTFS dir.
+    // Windows mount.exe can't bypass portmapper, so spawn nfsserve's
+    // `portmap_listener` on 127.0.0.1:111 to map NFS/MOUNT v3 to the actual
+    // server port. Requires Administrator (port 111 is privileged).
+    #[cfg(windows)]
+    let portmapper_handle = nfsserve::portmap_listener::spawn(
+        format!("{host}:111").parse().expect("loopback address"),
+        port,
+    )
+    .await
+    .map_err(|e| {
+        std::io::Error::other(format!(
+            "failed to bind portmapper on {host}:111: {e} (Administrator required, or another portmap is running)"
+        ))
+    })?;
+    let skip_auto_mount = cfg!(windows) && std::env::var_os("HF_MOUNT_SKIP_AUTO_MOUNT").is_some();
+    #[cfg(windows)]
+    {
+        let _ = actimeo; // mount.exe has no actimeo equivalent.
+        let mut opts = String::from("nolock,anon,mtype=hard,rsize=32,wsize=32,timeout=60");
+        if read_only {
+            opts.push_str(",ro");
+        }
+        let share = format!("\\\\{host}\\!");
+        let cmd = format!("mount.exe -o {opts} {share} {mount_point_str}");
+        if skip_auto_mount {
+            info!(
+                "HF_MOUNT_SKIP_AUTO_MOUNT set — server + portmapper running, mount.exe NOT invoked.\n\
+                 Run manually in another admin shell:\n  {cmd}"
+            );
+        } else {
+            info!("Running: {cmd}");
+            let output = tokio::process::Command::new("mount")
+                .args(["-o", &opts, &share, mount_point_str])
+                .output()
+                .await?;
+            if !output.status.success() {
+                server_handle.abort();
+                portmapper_handle.abort();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                return Err(std::io::Error::other(format!(
+                    "mount.exe failed with {} (is the 'Client for NFS' feature enabled? is the process running as Administrator?): cmd=`{cmd}` stdout={stdout} stderr={stderr}",
+                    output.status
+                )));
+            }
+        }
+    }
+
     info!("NFS mount active at {}", mount_point_str);
 
     // Signal the parent process that the mount is live (daemon mode).
@@ -633,9 +751,15 @@ pub async fn mount_nfs(
     // handle_forever() is an infinite accept() loop that never returns on its own.
     // On Linux, `umount` doesn't always send the UMNT RPC, so we also poll
     // /proc/mounts as a fallback to detect when the mount disappears.
+    // SIGTERM future: real signal listener on Unix, never-completing on Windows.
+    #[cfg(unix)]
     let mut sigterm =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("Failed to register SIGTERM");
-    tokio::pin!(server_handle);
+    #[cfg(unix)]
+    let sigterm_fut = async move { sigterm.recv().await };
+    #[cfg(not(unix))]
+    let sigterm_fut = std::future::pending::<Option<()>>();
+    tokio::pin!(server_handle, sigterm_fut);
     loop {
         tokio::select! {
             msg = mount_rx.recv() => {
@@ -656,19 +780,26 @@ pub async fn mount_nfs(
                 unmount_nfs(mount_point_str);
                 break;
             }
-            _ = sigterm.recv() => {
+            _ = &mut sigterm_fut => {
                 info!("Received SIGTERM, unmounting...");
                 unmount_nfs(mount_point_str);
                 break;
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                if !is_mounted(mount_point_str) {
+                if !skip_auto_mount && !is_mounted(mount_point_str) {
                     info!("NFS mount disappeared, shutting down");
                     break;
                 }
             }
         }
     }
+
+    // Stop the NFS server task explicitly (dropping the JoinHandle does not
+    // cancel a tokio task — the server would keep accept()ing on its socket).
+    server_handle.abort();
+    let _ = server_handle.await;
+    #[cfg(windows)]
+    portmapper_handle.abort();
 
     // Drain handle pool: flush and release all cached handles before VFS shutdown.
     let entries = pool_for_shutdown.lock().expect("handle_pool poisoned").drain();
@@ -879,31 +1010,14 @@ fn find_mount_nfs() -> Option<std::path::PathBuf> {
 
 /// Check if a path is still an active mount point.
 fn unmount_nfs(mount_point: &str) {
-    use std::ffi::CString;
-
-    // Try libc unmount first (no external process dependency).
-    if let Ok(c_path) = CString::new(mount_point) {
-        #[cfg(target_os = "linux")]
-        {
-            if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
-                return;
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
-                return;
-            }
-        }
-    }
-
-    // Fallback: external command.
-    #[cfg(target_os = "macos")]
-    if let Err(e) = std::process::Command::new("umount").arg(mount_point).status() {
-        tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
-    }
     #[cfg(target_os = "linux")]
     {
+        use std::ffi::CString;
+        if let Ok(c_path) = CString::new(mount_point)
+            && unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0
+        {
+            return;
+        }
         let result = if unsafe { libc::getuid() } == 0 {
             std::process::Command::new("umount").arg(mount_point).status()
         } else {
@@ -915,6 +1029,26 @@ fn unmount_nfs(mount_point: &str) {
             tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
         }
     }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        if let Ok(c_path) = CString::new(mount_point)
+            && unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0
+        {
+            return;
+        }
+        if let Err(e) = std::process::Command::new("umount").arg(mount_point).status() {
+            tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
+        }
+    }
+
+    // `umount.exe` ships with the Windows NFS client. `-f` forces unmount
+    // even if handles are still open.
+    #[cfg(windows)]
+    if let Err(e) = std::process::Command::new("umount").args(["-f", mount_point]).status() {
+        tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
+    }
 }
 
 fn is_mounted(path: &str) -> bool {
@@ -923,6 +1057,12 @@ fn is_mounted(path: &str) -> bool {
         std::fs::read_to_string("/proc/mounts")
             .map(|s| s.lines().any(|line| line.split_whitespace().nth(1) == Some(path)))
             .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        // Best-effort: the drive letter / mount path disappears from the FS namespace
+        // when the NFS mount is torn down. metadata() succeeds while it's live.
+        std::fs::metadata(path).is_ok()
     }
     #[cfg(target_os = "macos")]
     {
@@ -988,6 +1128,43 @@ mod tests {
     /// `virtual_fs.write()` which returned EBADF, and `errno_to_nfs` mapped
     /// that to STALE — at which point macOS NFS silently discards the write.
     ///
+    /// A handle from an earlier server (other inode numbers, other
+    /// generation) still names the same file, through the path it carries.
+    #[test]
+    fn handle_from_earlier_server_resolves_by_path() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hub = MockHub::new();
+        hub.add_file("a.txt", 1, Some("hash_a"), None);
+        hub.add_file("dir/b.txt", 1, Some("hash_b"), None);
+        let new_adapter = || {
+            let vfs = make_test_vfs(hub.clone(), MockXet::new(), TestOpts::default(), &rt);
+            let mut adapter = NFSAdapter::new(vfs, true);
+            adapter.path_handles = true;
+            adapter
+        };
+        let first = new_adapter();
+        // The second server lists more files, so "dir/b.txt" gets another inode.
+        hub.add_dir("aaa");
+        hub.add_file("aaa/c.txt", 1, Some("hash_c"), None);
+        let mut second = new_adapter();
+        second.generation = first.generation + 1;
+
+        rt.block_on(async {
+            let dir = first.lookup(1, &nfsstring(b"dir".to_vec())).await.unwrap();
+            let file = first.lookup(dir, &nfsstring(b"b.txt".to_vec())).await.unwrap();
+            let old_handle = first.id_to_fh(file);
+
+            let aaa = second.lookup(1, &nfsstring(b"aaa".to_vec())).await.unwrap();
+            second.lookup(aaa, &nfsstring(b"c.txt".to_vec())).await.unwrap();
+            let resolved = second.fh_to_id(&old_handle).expect("old handle resolves");
+            assert_ne!(file, resolved, "inode numbers differ between servers");
+            assert_eq!(second.virtual_fs.full_path(resolved).as_deref(), Some("dir/b.txt"));
+        });
+    }
+
     /// The fix: on EBADF, evict the read-only handle and re-open writable,
     /// then retry. This test exercises that exact sequence.
     #[test]
