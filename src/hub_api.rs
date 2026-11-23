@@ -2,13 +2,66 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
 
-use crate::error::{Error, Result, is_retryable_status};
+use crate::error::{Error, Result, is_retryable_status, is_transient_http};
+
+/// Characters that must be percent-encoded when a file path is interpolated
+/// into a URL path: `#` starts a fragment, `?` a query string, `%` corrupts
+/// decoding, and the rest are not valid in URL paths. `/` is intentionally
+/// kept so multi-segment paths stay multi-segment.
+const URL_PATH_ESCAPE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'?')
+    .add(b'<')
+    .add(b'>')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'|')
+    .add(b'\\')
+    .add(b'^');
+
+/// Percent-encode a file path for use in a URL path, preserving `/`.
+/// Borrows (no allocation) when nothing needs escaping — the common case.
+///
+/// Filenames with URL-reserved characters are routine: object_store-based
+/// writers (Lance, Delta) stage uploads as `name#1`, `name#2`, … — without
+/// encoding, everything after `#` is parsed as a fragment and every such
+/// file resolves to the same truncated URL.
+fn encode_url_path(path: &str) -> std::borrow::Cow<'_, str> {
+    utf8_percent_encode(path, URL_PATH_ESCAPE).into()
+}
+
+/// Revisions escape `/` too: a ref like `refs/pr/1` occupies a single path
+/// segment in `/resolve/{revision}/{path}` and `/tree/{revision}/{path}`, so
+/// it must land as `refs%2Fpr%2F1` — unencoded, the Hub parses the extra
+/// segments as part of the file path and returns 404.
+const URL_REVISION_ESCAPE: &AsciiSet = &URL_PATH_ESCAPE.add(b'/');
+
+/// Percent-encode a revision as a single URL path segment (see
+/// `URL_REVISION_ESCAPE`).
+fn encode_url_revision(revision: &str) -> std::borrow::Cow<'_, str> {
+    utf8_percent_encode(revision, URL_REVISION_ESCAPE).into()
+}
+
+/// The path of `path` relative to the directory `prefix`, if `path` lives
+/// strictly under `{prefix}/` — as opposed to merely sharing `prefix` as a
+/// raw key prefix (`a/1.manifest#1` vs `a/1.manifest`) or being `prefix`
+/// itself.
+pub(crate) fn strict_descendant_rel<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    path.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|rel| !rel.is_empty())
+}
 
 // ── HubOps trait ──────────────────────────────────────────────────────
 
@@ -34,6 +87,26 @@ pub trait HubOps: Send + Sync {
     /// the probe path keep doing full polls.
     async fn probe_revision(&self) -> Result<String> {
         Err(Error::hub("probe_revision not implemented"))
+    }
+
+    /// Open the bucket live-follow SSE stream (`GET /api/buckets/{id}/events`).
+    ///
+    /// `cursor` resumes strictly after a previously received opaque cursor;
+    /// `since` (ISO8601, e.g. the last `updatedAt` seen) replays changes from
+    /// that instant; with neither, only live changes stream (callers pass at
+    /// most one). `Ok(None)` means this source or deployment doesn't serve
+    /// the feed (repo source, 404, non-SSE response): the caller falls back
+    /// to polling permanently. Errors carry the HTTP status (a 400 means the
+    /// request itself was refused, e.g. an unparseable resume point) and, on
+    /// 503/429, the server's wait hint via [`Error::retry_after`]. The
+    /// default impl reports the feed as absent so mocks and non-bucket
+    /// sources use the poll fallback.
+    async fn follow_events(
+        &self,
+        _cursor: Option<&str>,
+        _since: Option<&str>,
+    ) -> Result<Option<Box<dyn crate::follow::FollowStreamOps>>> {
+        Ok(None)
     }
 }
 
@@ -208,6 +281,10 @@ pub struct HubApiClient {
     /// Client that does NOT follow redirects — used for HEAD requests where we
     /// need response headers from the Hub (not from the CAS redirect target).
     head_client: Client,
+    /// Client for the live-follow SSE stream: no whole-request timeout (the
+    /// stream is long-lived by design), a per-read timeout instead. The
+    /// server pings every 30s, so 90s of silence means a dead connection.
+    follow_client: Client,
     endpoint: String,
     token: Option<String>,
     /// Path to a file containing the API token. Re-read periodically so
@@ -267,25 +344,38 @@ pub fn split_path_prefix(raw: &str) -> std::result::Result<(&str, &str), &'stati
     }
 }
 
-fn retry_delay(attempt: u32) -> std::time::Duration {
+pub(crate) fn retry_delay(attempt: u32) -> std::time::Duration {
     debug_assert!(attempt > 0, "retry_delay called with attempt=0");
-    std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1))
+    // Saturating: callers cap the result (MAX_RETRY_DELAY), but a long
+    // startup retry loop can push `attempt` past 63 and 2^attempt would
+    // overflow before the cap applies.
+    std::time::Duration::from_millis(500u64.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1))))
 }
 
-/// Parse the IETF `RateLimit` header for `t=<seconds>` (time until window reset), capped at 30s.
-/// Format: `"resource_type";r=<remaining>;t=<seconds_until_reset>`
-/// This is what moon-landing sends on 429 responses.
+/// Upper bound on a single in-request retry sleep, whether server-hinted
+/// (RateLimit / Retry-After header) or exponential.
+pub(crate) const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A response header as a string, when present and ASCII.
+fn header_str<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// Server-requested wait before retrying, uncapped (each retry loop applies
+/// its own ceiling): the IETF `RateLimit` header's `t=<seconds>` (time until
+/// window reset, what moon-landing sends on 429; format
+/// `"resource_type";r=<remaining>;t=<seconds_until_reset>`), else a
+/// `Retry-After: <seconds>` header (what the live-follow endpoint sends on
+/// 503). A zero hint means the window already reset: no hint, use the
+/// backoff schedule rather than retrying immediately.
 fn parse_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
-    let value = headers.get("ratelimit")?.to_str().ok()?;
-    for part in value.split(';') {
-        let part = part.trim();
-        if let Some(secs_str) = part.strip_prefix("t=")
-            && let Ok(secs) = secs_str.parse::<u64>()
-        {
-            return Some(std::time::Duration::from_secs(secs.min(30)));
-        }
-    }
-    None
+    let ratelimit_secs = header_str(headers, "ratelimit").and_then(|value| {
+        value
+            .split(';')
+            .find_map(|part| part.trim().strip_prefix("t=")?.parse::<u64>().ok())
+    });
+    let secs = ratelimit_secs.or_else(|| header_str(headers, "retry-after")?.trim().parse::<u64>().ok())?;
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
 /// Build an authenticated GET request during client initialization (before HubApiClient exists).
@@ -336,6 +426,8 @@ async fn probe_repo(
 
 /// Send an HTTP request with automatic retry on transient errors (408, 429, 5xx, timeouts).
 /// Uses the IETF RateLimit header's t= parameter when present, falls back to exponential backoff (2 retries max).
+/// When the retries are exhausted the returned error carries the server's last
+/// RateLimit hint (`Error::retry_after`) so an outer loop can keep honoring it.
 /// Set `accept_redirects` to treat 3xx as success (needed for HEAD on /resolve/ endpoints
 /// where the redirect response itself carries metadata headers).
 async fn send_with_retry(
@@ -353,16 +445,23 @@ async fn send_with_retry(
             }
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                let hinted_delay = parse_retry_delay(resp.headers());
                 if is_retryable_status(status) && attempt <= MAX_RETRIES {
-                    let delay = parse_retry_delay(resp.headers()).unwrap_or_else(|| retry_delay(attempt));
+                    let delay = hinted_delay
+                        .unwrap_or_else(|| retry_delay(attempt))
+                        .min(MAX_RETRY_DELAY);
                     warn!("{context}: transient error ({status}), retry {attempt}/{MAX_RETRIES} in {delay:?}");
                     tokio::time::sleep(delay).await;
                     continue;
                 }
                 let body = resp.text().await.unwrap_or_default();
-                return Err(Error::hub_status(status, format!("{context}: {status} {body}")));
+                return Err(Error::Hub {
+                    message: format!("{context}: {status} {body}"),
+                    status: Some(status),
+                    retry_after: hinted_delay,
+                });
             }
-            Err(err) if (err.is_timeout() || err.is_connect()) && attempt <= MAX_RETRIES => {
+            Err(err) if is_transient_http(&err) && attempt <= MAX_RETRIES => {
                 let delay = retry_delay(attempt);
                 warn!("{context}: transient error, retry {attempt}/{MAX_RETRIES} in {delay:?}: {err}");
                 tokio::time::sleep(delay).await;
@@ -372,9 +471,9 @@ async fn send_with_retry(
     }
 }
 
-fn make_clients(backend: &str) -> (Client, Client) {
+fn make_clients(backend: &str) -> (Client, Client, Client) {
     let user_agent = format!("hf-mount/{}; fs/{}", env!("CARGO_PKG_VERSION"), backend);
-    // Idle pool / keep-alive shared across both clients so a hung Hub doesn't
+    // Idle pool / keep-alive shared across the clients so a hung Hub doesn't
     // freeze the poll loop and TLS handshakes are amortized across rounds.
     let base = || {
         reqwest::Client::builder()
@@ -392,7 +491,14 @@ fn make_clients(backend: &str) -> (Client, Client) {
         .timeout(Duration::from_secs(30))
         .build()
         .expect("failed to build head_client");
-    (client, head_client)
+    // See HubApiClient::follow_client: a whole-request timeout would cut the
+    // SSE stream mid-session, so bound each body read instead — the server's
+    // 30s pings keep a healthy connection under the 90s ceiling.
+    let follow_client = base()
+        .read_timeout(Duration::from_secs(90))
+        .build()
+        .expect("failed to build follow_client");
+    (client, head_client, follow_client)
 }
 
 impl HubApiClient {
@@ -407,7 +513,7 @@ impl HubApiClient {
         path_prefix: String,
         backend: &str,
     ) -> Result<Arc<Self>> {
-        let (client, head_client) = make_clients(backend);
+        let (client, head_client, follow_client) = make_clients(backend);
         let endpoint = endpoint.trim_end_matches('/').to_string();
 
         let (source, last_modified) = match source {
@@ -440,23 +546,28 @@ impl HubApiClient {
             SourceKind::Bucket { bucket_id } => {
                 let url = format!("{}/api/buckets/{}", endpoint, bucket_id);
                 let context = format!("resolve bucket {bucket_id}");
-                let resp = match send_with_retry(|| init_auth_get(&client, &url, token, &token_file), &context, false)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(err) => {
-                        // Common mistake: user passed a repo id to `bucket`. Probe the
-                        // repo APIs and, if one matches, surface a hint instead of the
-                        // raw 401 from the bucket endpoint.
-                        if let Some(repo_type) = probe_repo(&client, &endpoint, &bucket_id, token, &token_file).await {
-                            return Err(Error::hub(format!(
-                                "{bucket_id} is not a bucket, but it exists as a {repo_type}. \
+                let resp =
+                    match send_with_retry(|| init_auth_get(&client, &url, token, &token_file), &context, false).await {
+                        Ok(r) => r,
+                        Err(err) => {
+                            // Common mistake: user passed a repo id to `bucket`. Probe the
+                            // repo APIs and, if one matches, surface a hint instead of the
+                            // raw 401 from the bucket endpoint. Skip the probe on transient
+                            // failures (rate limit, 5xx): it cannot succeed while the user
+                            // is being throttled, and startup retries would multiply its 3
+                            // extra requests into the very storm being waited out.
+                            if !err.is_transient()
+                                && let Some(repo_type) =
+                                    probe_repo(&client, &endpoint, &bucket_id, token, &token_file).await
+                            {
+                                return Err(Error::hub(format!(
+                                    "{bucket_id} is not a bucket, but it exists as a {repo_type}. \
                                  Use `repo {bucket_id}` (read-only) instead of `bucket {bucket_id}`."
-                            )));
+                                )));
+                            }
+                            return Err(err);
                         }
-                        return Err(err);
-                    }
-                };
+                    };
                 let body: serde_json::Value = resp.json().await?;
                 let last_modified = body["updatedAt"].as_str().map(mtime_from_str).unwrap_or(UNIX_EPOCH);
                 (SourceKind::Bucket { bucket_id }, last_modified)
@@ -466,6 +577,7 @@ impl HubApiClient {
         Ok(Arc::new(Self {
             client,
             head_client,
+            follow_client,
             endpoint,
             token: token.map(|t| t.to_string()),
             token_file,
@@ -478,10 +590,11 @@ impl HubApiClient {
 
     /// Create a client for a HuggingFace bucket.
     pub fn new(endpoint: &str, token: Option<&str>, bucket_id: &str, backend: &str) -> Arc<Self> {
-        let (client, head_client) = make_clients(backend);
+        let (client, head_client, follow_client) = make_clients(backend);
         Arc::new(Self {
             client,
             head_client,
+            follow_client,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             token: token.map(|t| t.to_string()),
             token_file: None,
@@ -563,8 +676,7 @@ impl HubApiClient {
             // The prefix directory itself — caller should filter this out.
             return Some("");
         }
-        full.strip_prefix(&self.path_prefix)
-            .and_then(|rest| rest.strip_prefix('/'))
+        strict_descendant_rel(full, &self.path_prefix)
     }
 
     /// Validate that the path prefix exists on the remote.
@@ -618,9 +730,69 @@ impl HubApiClient {
         }
     }
 
+    /// Open the bucket live-follow SSE stream. See [`HubOps::follow_events`]
+    /// for the contract; this is the transport: `GET
+    /// /api/buckets/{id}/events` with `Accept: text/event-stream` (mandatory
+    /// — the server 400s without it) and the same bearer auth as tree calls.
+    /// No `send_with_retry`: a 503 here has dedicated semantics (this pod
+    /// doesn't serve the feed or is catching up; its `Retry-After` is
+    /// surfaced through [`Error::retry_after`]) and everything else is
+    /// handled by the caller's reconnect/backoff loop.
+    pub async fn follow_events(
+        &self,
+        cursor: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Option<Box<dyn crate::follow::FollowStreamOps>>> {
+        let SourceKind::Bucket { bucket_id } = &self.source else {
+            return Ok(None); // repos have no live-follow feed
+        };
+        let url = format!("{}/api/buckets/{}/events", self.endpoint, bucket_id);
+        let mut req = self
+            .auth(self.follow_client.get(&url))
+            .header("accept", "text/event-stream");
+        if let Some(cursor) = cursor {
+            req = req.query(&[("cursor", cursor)]);
+        } else if let Some(since) = since {
+            req = req.query(&[("since", since)]);
+        }
+        let resp = req.send().await.map_err(Error::Http)?;
+        let status = resp.status().as_u16();
+        if status == 404 {
+            debug!("live-follow: endpoint not served by this Hub (404)");
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let retry_after = parse_retry_delay(resp.headers());
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Hub {
+                message: format!("live-follow: {status} {body}"),
+                status: Some(status),
+                retry_after,
+            });
+        }
+        // A 200 that isn't an event stream (a proxy or intermediate Hub
+        // build answering with HTML/JSON) would never yield an event: treat
+        // it as "feed not served" rather than reconnecting forever.
+        let content_type = header_str(resp.headers(), "content-type").unwrap_or_default();
+        if !content_type.starts_with("text/event-stream") {
+            warn!("live-follow: endpoint answered with content-type {content_type:?}, not an event stream");
+            return Ok(None);
+        }
+        Ok(Some(Box::new(crate::follow::HttpFollowStream::new(
+            resp,
+            self.path_prefix.clone(),
+        ))))
+    }
+
     /// List tree entries at the given prefix (single directory level).
     /// Follows `Link` header pagination. For repos, includes `expand=true`
     /// to get per-file lastCommit (mtime). For buckets, passes `recursive=false`.
+    ///
+    /// Only entries strictly under `{prefix}/` are returned: the bucket tree
+    /// API matches by raw S3 key prefix (listing `a/1.manifest` also returns
+    /// the sibling `a/1.manifest#1`), so raw-prefix matches are filtered out
+    /// here, at the boundary where that server behavior originates. Consumers
+    /// can rely on every entry being a descendant of `prefix`.
     pub async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         let api_prefix = self.prefixed_path(prefix);
         let mut entries = match &self.source {
@@ -631,6 +803,9 @@ impl HubApiClient {
                 revision,
             } => self.list_tree_repo(repo_id, *repo_type, revision, &api_prefix).await?,
         };
+        if !api_prefix.is_empty() {
+            entries.retain(|e| strict_descendant_rel(&e.path, &api_prefix).is_some());
+        }
 
         // Strip path prefix from returned entries and filter out the prefix dir itself.
         if !self.path_prefix.is_empty() {
@@ -656,7 +831,9 @@ impl HubApiClient {
         } else {
             format!(
                 "{}/api/buckets/{}/tree/{}{recursive_param}",
-                self.endpoint, bucket_id, prefix
+                self.endpoint,
+                bucket_id,
+                encode_url_path(prefix)
             )
         };
 
@@ -696,7 +873,7 @@ impl HubApiClient {
                 self.endpoint,
                 repo_type.api_prefix(),
                 repo_id,
-                revision,
+                encode_url_revision(revision),
             )
         } else {
             format!(
@@ -704,8 +881,8 @@ impl HubApiClient {
                 self.endpoint,
                 repo_type.api_prefix(),
                 repo_id,
-                revision,
-                prefix,
+                encode_url_revision(revision),
+                encode_url_path(prefix),
             )
         };
 
@@ -747,11 +924,11 @@ impl HubApiClient {
         Ok(all_entries)
     }
 
-    /// Fetch metadata for a single file via HEAD on the resolve endpoint.
-    /// Returns `None` if 404 (file does not exist remotely).
-    pub async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
-        let api_path = self.prefixed_path(path);
-        let url = match &self.source {
+    /// Build the resolve-endpoint URL for `path` (prefixed and URL-encoded).
+    fn resolve_url(&self, path: &str) -> String {
+        let prefixed = self.prefixed_path(path);
+        let api_path = encode_url_path(&prefixed);
+        match &self.source {
             // Buckets: /buckets/{id}/resolve/{path} (no /api/ prefix)
             SourceKind::Bucket { bucket_id } => {
                 format!("{}/buckets/{}/resolve/{}", self.endpoint, bucket_id, api_path)
@@ -767,11 +944,17 @@ impl HubApiClient {
                     self.endpoint,
                     repo_type.resolve_prefix(),
                     repo_id,
-                    revision,
+                    encode_url_revision(revision),
                     api_path,
                 )
             }
-        };
+        }
+    }
+
+    /// Fetch metadata for a single file via HEAD on the resolve endpoint.
+    /// Returns `None` if 404 (file does not exist remotely).
+    pub async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
+        let url = self.resolve_url(path);
         let resp = send_with_retry(|| self.auth(self.head_client.head(&url)), "head_file", true).await;
         let resp = match resp {
             Ok(r) => r,
@@ -779,22 +962,25 @@ impl HubApiClient {
             Err(err) => return Err(err),
         };
 
+        let redirected = resp.status().is_redirection();
         let headers = resp.headers();
         let xet_hash = headers
             .get("x-xet-hash")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        // Prefer x-linked-size (LFS pointer's true blob size). For non-LFS files
-        // the resolve endpoint serves the file directly, so content-length is the
-        // real size.
+        // On a redirect (LFS/Xet files to the CDN, plain files of public repos
+        // to /api/resolve-cache), content-length and etag describe the redirect
+        // body, not the file: only the x-linked-* headers apply. Without
+        // x-linked-size the size stays unknown and callers fall back to the
+        // tree listing. A 200 (private or gated repos) serves the file itself.
         let size = headers
             .get("x-linked-size")
-            .or_else(|| headers.get("content-length"))
+            .or_else(|| headers.get("content-length").filter(|_| !redirected))
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
         let etag = headers
             .get("x-linked-etag")
-            .or_else(|| headers.get("etag"))
+            .or_else(|| headers.get("etag").filter(|_| !redirected))
             .and_then(|v| v.to_str().ok())
             .map(|s| s.trim_matches('"').to_string());
         let last_modified = headers
@@ -826,7 +1012,7 @@ impl HubApiClient {
                     self.endpoint,
                     repo_type.api_prefix(),
                     repo_id,
-                    revision,
+                    encode_url_revision(revision),
                 )
             }
         };
@@ -910,26 +1096,7 @@ impl HubApiClient {
     /// sidecar `{dest}.etag` file is present, sends `If-None-Match`. On 304 the
     /// existing cached file is kept as-is.
     pub async fn download_file_http(&self, path: &str, dest: &Path) -> Result<()> {
-        let api_path = self.prefixed_path(path);
-        let url = match &self.source {
-            SourceKind::Bucket { bucket_id } => {
-                format!("{}/buckets/{}/resolve/{}", self.endpoint, bucket_id, api_path)
-            }
-            SourceKind::Repo {
-                repo_id,
-                repo_type,
-                revision,
-            } => {
-                format!(
-                    "{}/{}{}/resolve/{}/{}",
-                    self.endpoint,
-                    repo_type.resolve_prefix(),
-                    repo_id,
-                    revision,
-                    api_path,
-                )
-            }
-        };
+        let url = self.resolve_url(path);
 
         // Read cached ETag only if dest exists — otherwise an orphan sidecar
         // (e.g. user manually deleted dest) could trick us into a 304 and
@@ -1052,6 +1219,13 @@ impl HubOps for HubApiClient {
     }
     async fn probe_revision(&self) -> Result<String> {
         self.probe_revision().await
+    }
+    async fn follow_events(
+        &self,
+        cursor: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Option<Box<dyn crate::follow::FollowStreamOps>>> {
+        self.follow_events(cursor, since).await
     }
 }
 
@@ -1292,10 +1466,11 @@ mod tests {
     // ── prefixed_path / strip_path_prefix tests ───────────────────────
 
     fn make_test_client(prefix: &str, token_file: Option<PathBuf>) -> HubApiClient {
-        let (client, head_client) = make_clients("test");
+        let (client, head_client, follow_client) = make_clients("test");
         HubApiClient {
             client,
             head_client,
+            follow_client,
             endpoint: "https://huggingface.co".to_string(),
             token: Some("static-token".to_string()),
             token_file,
@@ -1306,6 +1481,74 @@ mod tests {
             last_modified: UNIX_EPOCH,
             path_prefix: prefix.to_string(),
         }
+    }
+
+    #[test]
+    fn test_encode_url_path_passthrough() {
+        assert_eq!(encode_url_path("file.txt"), "file.txt");
+        assert_eq!(encode_url_path("a/b/c.lance"), "a/b/c.lance");
+        assert_eq!(encode_url_path(""), "");
+    }
+
+    #[test]
+    fn test_encode_url_path_reserved_chars() {
+        // object_store staging suffix: the `#` must not become a URL fragment
+        assert_eq!(encode_url_path("_versions/1.manifest#1"), "_versions/1.manifest%231");
+        assert_eq!(encode_url_path("a?b.txt"), "a%3Fb.txt");
+        assert_eq!(encode_url_path("100%.txt"), "100%25.txt");
+        assert_eq!(encode_url_path("a b/c d.txt"), "a%20b/c%20d.txt");
+    }
+
+    #[test]
+    fn test_resolve_url_prefixes_and_encodes() {
+        let c = make_test_client("", None);
+        assert_eq!(
+            c.resolve_url("_versions/1.manifest#1"),
+            "https://huggingface.co/buckets/user/bucket/resolve/_versions/1.manifest%231"
+        );
+        let c = make_test_client("sub/dir", None);
+        assert_eq!(
+            c.resolve_url("a b.txt"),
+            "https://huggingface.co/buckets/user/bucket/resolve/sub/dir/a%20b.txt"
+        );
+    }
+
+    #[test]
+    fn test_encode_url_revision_single_segment() {
+        // Plain revisions pass through.
+        assert_eq!(encode_url_revision("main"), "main");
+        // Refs must stay a single path segment: the Hub 404s on the
+        // unencoded form (extra segments parse as part of the file path).
+        assert_eq!(encode_url_revision("refs/pr/1"), "refs%2Fpr%2F1");
+        assert_eq!(encode_url_revision("refs/convert/parquet"), "refs%2Fconvert%2Fparquet");
+    }
+
+    #[test]
+    fn test_resolve_url_encodes_revision() {
+        let mut c = make_test_client("", None);
+        c.source = SourceKind::Repo {
+            repo_id: "user/model".to_string(),
+            repo_type: RepoType::Model,
+            revision: "refs/pr/1".to_string(),
+        };
+        assert_eq!(
+            c.resolve_url("config.json"),
+            "https://huggingface.co/user/model/resolve/refs%2Fpr%2F1/config.json"
+        );
+    }
+
+    #[test]
+    fn test_strict_descendant_rel() {
+        // Real children (any depth) are in, relative path returned.
+        assert_eq!(strict_descendant_rel("a/b.txt", "a"), Some("b.txt"));
+        assert_eq!(strict_descendant_rel("a/b/c.txt", "a"), Some("b/c.txt"));
+        // Raw S3 key-prefix matches are NOT children: the sibling staging
+        // files of object_store writers (`1.manifest#1`) must not make
+        // `1.manifest` look like a directory.
+        assert_eq!(strict_descendant_rel("a/1.manifest#1", "a/1.manifest"), None);
+        assert_eq!(strict_descendant_rel("ab.txt", "a"), None);
+        // The path itself is not its own descendant.
+        assert_eq!(strict_descendant_rel("a", "a"), None);
     }
 
     #[test]
@@ -1424,10 +1667,29 @@ mod tests {
     // ── retry / error helpers ─────────────────────────────────────────
 
     #[test]
+    fn parse_retry_delay_ignores_zero_hint() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("ratelimit", r#""hub_api";r=0;t=0"#.parse().unwrap());
+        assert_eq!(parse_retry_delay(&headers), None);
+    }
+
+    #[test]
+    fn parse_retry_delay_falls_back_to_retry_after() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "7".parse().unwrap());
+        assert_eq!(parse_retry_delay(&headers), Some(std::time::Duration::from_secs(7)));
+        // RateLimit wins when both are present.
+        headers.insert("ratelimit", r#""hub_api";r=0;t=3"#.parse().unwrap());
+        assert_eq!(parse_retry_delay(&headers), Some(std::time::Duration::from_secs(3)));
+    }
+
+    #[test]
     fn retry_delay_exponential_backoff() {
         assert_eq!(retry_delay(1), std::time::Duration::from_millis(500));
         assert_eq!(retry_delay(2), std::time::Duration::from_millis(1000));
         assert_eq!(retry_delay(3), std::time::Duration::from_millis(2000));
+        // Saturates instead of overflowing on long retry loops.
+        assert!(retry_delay(200) >= MAX_RETRY_DELAY);
     }
 
     #[test]
@@ -1452,7 +1714,8 @@ mod tests {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("ratelimit", r#""hub_api";r=0;t=45"#.parse().unwrap());
         let duration = parse_retry_delay(&headers).unwrap();
-        assert_eq!(duration, std::time::Duration::from_secs(30)); // capped
+        // Raw hint: each retry loop applies its own ceiling.
+        assert_eq!(duration, std::time::Duration::from_secs(45));
     }
 
     #[test]
@@ -1598,6 +1861,60 @@ mod tests {
         let result = send_with_retry(|| client.get(&url), "test", false).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Hub { status: Some(302), .. }));
+    }
+
+    // ── head_file tests ───────────────────────────────────────────────
+
+    /// HEAD `file.txt` against a server that answers once with `status` and `headers`.
+    async fn head_file_with_response(status: &str, headers: &str) -> HeadFileInfo {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response = format!("HTTP/1.1 {status}\r\n{headers}connection: close\r\n\r\n");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            stream.write_all(response.as_bytes()).await.ok();
+            stream.shutdown().await.ok();
+        });
+
+        let mut client = make_test_client("", None);
+        client.endpoint = format!("http://{addr}");
+        client.head_file("file.txt").await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn head_file_redirect_ignores_content_length_and_etag() {
+        // Plain file in a public repo: the 307 to /api/resolve-cache carries
+        // the redirect body's content-length (246), not the file's (665).
+        let info = head_file_with_response(
+            "307 Temporary Redirect",
+            "content-length: 246\r\netag: \"redirect\"\r\nlocation: /api/resolve-cache/file.txt\r\n",
+        )
+        .await;
+        assert_eq!(info.size, None);
+        assert_eq!(info.etag, None);
+    }
+
+    #[tokio::test]
+    async fn head_file_redirect_uses_linked_headers() {
+        let info = head_file_with_response(
+            "307 Temporary Redirect",
+            "content-length: 246\r\nx-linked-size: 665\r\nx-linked-etag: \"10c6\"\r\nlocation: /api/resolve-cache/file.txt\r\n",
+        )
+        .await;
+        assert_eq!(info.size, Some(665));
+        assert_eq!(info.etag.as_deref(), Some("10c6"));
+    }
+
+    #[tokio::test]
+    async fn head_file_direct_response_uses_content_length() {
+        // Private or gated repo: the plain file is served directly with a 200.
+        let info = head_file_with_response("200 OK", "content-length: 665\r\netag: \"10c6\"\r\n").await;
+        assert_eq!(info.size, Some(665));
+        assert_eq!(info.etag.as_deref(), Some("10c6"));
     }
 
     // ── probe_repo tests ──────────────────────────────────────────────

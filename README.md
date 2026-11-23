@@ -225,16 +225,21 @@ The same `FUSE_NOTIFY_INVAL_INODE` writev can also wedge at **runtime** (not jus
 | `--advanced-writes` | `false` | Enable staging files + async flush (random writes, seek, overwrite) |
 | `--poll-interval-secs` | `30` | Remote change polling interval (0 to disable) |
 | `--poll-listing-concurrency` | `4` | Max concurrent tree-listing requests per poll round. Main knob to throttle load on the Hub `/api` endpoint; lower it in shared environments where many mounts poll in parallel. |
+| `--live-follow` | `true` | Subscribe to the Hub's bucket live-follow event stream (SSE): remote changes are applied to loaded directories as they happen, and the periodic poll fan-out is skipped while the stream is healthy. Falls back to interval polling automatically when the Hub doesn't serve the feed (older deployments, repo mounts). Works with `--poll-interval-secs 0` too (no fallback then). Disable with `--live-follow=false`. |
 | `--max-threads` | `16` | Maximum FUSE worker threads (Linux only) |
+| `--read-ahead-mb` | `1024` | Memory for read-ahead, shared by the files open on the mount (MiB). Files read at once split it, and one file holds at most 512 MiB of it. Lower it where the daemon has a tight memory limit, together with `HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT` (xet-core download buffers, 1 GiB by default). |
 | `--metadata-ttl-ms` | `10000` | How long file metadata is cached before re-checking (ms) |
 | `--metadata-ttl-minimal` | `false` | Re-check on every access (maximum freshness, lower throughput) |
+| `--negative-ttl-ms` | `1000` | How long a lookup miss (ENOENT) is remembered before re-probing the Hub. Caps HEAD traffic for missing paths; also the longest a remotely-added file stays hidden from a client that probed it before it existed. |
 | `--flush-debounce-ms` | `2000` | Advanced writes: flush debounce delay (ms) |
 | `--flush-max-batch-window-ms` | `30000` | Advanced writes: max flush batch window (ms) |
+| `--flush-interval-ms` | `0` | Advanced writes: also flush open dirty files every N ms, so long-lived writers (logs, incremental checkpoints) publish without closing. Readers may see a partially written file. `0` = flush on close/fsync only. |
 | `--flush-shutdown-timeout-ms` | `45000` | Advanced writes: max time the SIGTERM flush drain may run before abandoning unflushed data to guarantee exit. Must be < the pod's `terminationGracePeriodSeconds`, or a slow Hub/CAS backend keeps the FUSE connection alive past grace and strands the pod. |
 | `--no-disk-cache` | `false` | Disable local chunk cache (every read fetches from HF) |
 | `--direct-io` | `false` | Bypass the kernel page cache (FOPEN_DIRECT_IO); every read goes through the FUSE handler. For benchmarking; not recommended in production (disables efficient mmap caching). |
 | `--no-filter-os-files` | `false` | Stop filtering OS junk files (.DS_Store, Thumbs.db, etc.) |
 | `--uid` / `--gid` | current user | Override UID/GID for mounted files |
+| `--dir-mode` / `--file-mode` | `0755` / `0644` | Octal permission bits reported for directories/files listed from the remote (which stores no POSIX metadata). Entries created through the mount keep their requested mode. Use `0777` / `0666` to let any local user write to a bucket mounted by another UID. |
 | `--fuse-owner-only` | `false` | Restrict mount access to the mounting user only (FUSE only; by default all users can access, which requires `user_allow_other` in /etc/fuse.conf) |
 | `--token-file` | | Path to a token file (re-read on each request for credential rotation) |
 | `--inode-soft-limit` | `0` | Soft cap on the in-memory inode table (0 disables). See "Bounding inode memory" below. |
@@ -290,20 +295,23 @@ RUST_LOG=hf_mount=debug hf-mount-fuse repo gpt2 /mnt/gpt2
 - **Subfolder mounting** -- mount only a subdirectory (e.g. `user/model/ckpt/v2`)
 - **Simple writes** (default) -- append-only, in-memory, synchronous upload on close
 - **Advanced writes** (`--advanced-writes`) -- staging files on disk, random writes + seek, async debounced flush
-- **Remote sync** -- background polling detects remote changes and updates the local view
+- **Remote sync** -- a live-follow event stream (buckets) plus background polling keep the local view in sync with remote changes
 - **POSIX metadata** -- chmod, chown, timestamps, symlinks (in-memory only, lost on unmount)
 - **Overlay mode** (`--overlay`) -- mount point doubles as a writable local layer; remote stays read-only
 
 ## Consistency model
 
-hf-mount provides **eventual consistency** with remote changes. There is no push notification from the Hub; all freshness relies on client-side polling.
+hf-mount provides **eventual consistency** with remote changes. For buckets, a live-follow event stream pushes remote changes to the mount as they happen; per-file revalidation and interval polling cover repos, older Hub deployments, and gaps in the stream.
 
 ### Reads
 
-Files can be stale for up to `--metadata-ttl-ms` (default 10 s) after a remote update. Two mechanisms detect changes:
+Files can be stale for up to `--metadata-ttl-ms` (default 10 s) after a remote update. Three mechanisms detect changes:
 
-1. **Metadata revalidation** (FUSE only) -- when the per-file TTL expires, the next access checks the Hub. If the file changed, cached data is invalidated.
-2. **Background polling** (default every 30 s) -- lists the full tree and detects additions, modifications, and deletions.
+1. **Live-follow stream** (buckets, default on, `--live-follow`) -- subscribes to the Hub's `/api/buckets/{id}/events` SSE feed; adds, updates, and deletes land in already-loaded directories within about a second of the remote commit. On any stream interruption the client reconnects with its last cursor; when the server can't resume (its replay buffer covers ~15 min), one full poll round reconciles before re-subscribing. Reconnects back off exponentially (10 s base, honoring `Retry-After`). If the Hub doesn't serve the feed, or streams keep dying before the initial `ready`, the mount falls back to interval polling for the session.
+2. **Metadata revalidation** (FUSE only) -- when the per-file TTL expires, the next access checks the Hub. If the file changed, cached data is invalidated.
+3. **Background polling** (default every 30 s) -- lists the full tree and detects additions, modifications, and deletions. Skipped entirely while the live-follow stream is healthy.
+
+A lookup of a path that does not exist yet probes the Hub directly, so a file added remotely is visible as soon as the upload lands. Repeated misses are served from a negative cache for `--negative-ttl-ms` (default 1 s) without hitting the Hub; a client that probes a path before the producer finishes uploading sees it at most that long after it lands.
 
 ### Writes
 
@@ -336,7 +344,7 @@ Files can be stale for up to `--metadata-ttl-ms` (default 10 s) after a remote u
 
 hf-mount sits between your application and the Hugging Face Hub. It presents a standard filesystem interface (FUSE or NFS) and translates file operations into Hub API calls and storage fetches.
 
-Reads go through an adaptive prefetch buffer that starts small and grows with sequential access. Writes are uploaded to HF storage and committed via the Hub API. A background poll loop keeps the local view in sync with remote changes.
+Reads fetch remote data in blocks, several ranges at a time, with a read-ahead window that grows for each sequential stream, so parallel readers of one file (such as memory-mapped model loaders) do not wait on each other. Writes are uploaded to HF storage and committed via the Hub API. A background poll loop keeps the local view in sync with remote changes.
 
 Built on [xet-core](https://github.com/huggingface/xet-core) for content-addressed storage and efficient file transfers, and [fuser](https://github.com/cberner/fuser) for the FUSE implementation.
 
